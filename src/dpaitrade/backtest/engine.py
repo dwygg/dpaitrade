@@ -1,0 +1,455 @@
+from __future__ import annotations
+
+import logging
+from dataclasses import replace
+from datetime import datetime
+from typing import Iterable, Optional, Protocol
+
+from dpaitrade.agent.interface import BaseAgent
+from dpaitrade.core.types import (
+    AgentDecision,
+    BacktestResult,
+    BacktestStep,
+    PortfolioState,
+    RiskDecision,
+    TradeRecord,
+)
+
+
+class RiskManager(Protocol):
+    """
+    风控器协议。
+
+    后续真正的风控模块只要实现 review 方法即可接入。
+    """
+
+    def review(
+        self,
+        market_state,
+        signal,
+        agent_decision: AgentDecision,
+        portfolio_state: PortfolioState,
+    ) -> RiskDecision:
+        """
+        审核当前候选信号是否允许进入执行阶段。
+        """
+        ...
+
+
+class ExecutionSimulator(Protocol):
+    """
+    执行模拟器协议。
+
+    后续真正的成交仿真模块只要实现 execute 方法即可接入。
+    """
+
+    def execute(
+        self,
+        market_state,
+        signal,
+        risk_decision: RiskDecision,
+        portfolio_state: PortfolioState,
+    ) -> Optional[TradeRecord]:
+        """
+        执行模拟交易。
+
+        返回：
+        - TradeRecord: 有成交且已形成记录
+        - None: 本步未发生可记录的交易
+        """
+        ...
+
+
+class DefaultRiskManager:
+    """
+    默认风控器。
+
+    这不是最终版本，只是一个最小可用占位实现，
+    用于先打通主流程。
+    """
+
+    def __init__(
+        self,
+        default_risk_pct: float = 0.005,
+        max_used_risk_pct: float = 0.02,
+        max_consecutive_losses: int = 3,
+        max_spread: float = 5.0,
+    ) -> None:
+        self.default_risk_pct = default_risk_pct
+        self.max_used_risk_pct = max_used_risk_pct
+        self.max_consecutive_losses = max_consecutive_losses
+        self.max_spread = max_spread
+
+    def review(
+        self,
+        market_state,
+        signal,
+        agent_decision: AgentDecision,
+        portfolio_state: PortfolioState,
+    ) -> RiskDecision:
+        """
+        默认风控审批逻辑：
+
+        - 点差过大，拒绝
+        - 连续亏损过多，拒绝
+        - 当前风险占用过高，拒绝
+        - 否则按 agent 的 risk_adjustment 计算单笔风险
+        """
+
+        if market_state.spread > self.max_spread:
+            return RiskDecision.reject(
+                reject_reason=(
+                    f"风控拒绝：当前点差过大（spread={market_state.spread:.4f} > "
+                    f"{self.max_spread:.4f}）"
+                ),
+                meta={"spread": market_state.spread},
+            )
+
+        if portfolio_state.consecutive_losses >= self.max_consecutive_losses:
+            return RiskDecision.reject(
+                reject_reason=(
+                    f"风控拒绝：连续亏损次数过多（{portfolio_state.consecutive_losses}）"
+                ),
+                meta={"consecutive_losses": portfolio_state.consecutive_losses},
+            )
+
+        if portfolio_state.used_risk_pct >= self.max_used_risk_pct:
+            return RiskDecision.reject(
+                reject_reason=(
+                    f"风控拒绝：当前风险占用过高（{portfolio_state.used_risk_pct:.4f}）"
+                ),
+                meta={"used_risk_pct": portfolio_state.used_risk_pct},
+            )
+
+        adjusted_risk = self.default_risk_pct * max(agent_decision.risk_adjustment, 0.0)
+        adjusted_risk = min(adjusted_risk, self.max_used_risk_pct)
+
+        if adjusted_risk <= 0:
+            return RiskDecision.reject(
+                reject_reason="风控拒绝：计算后的单笔风险小于等于 0",
+                meta={"adjusted_risk": adjusted_risk},
+            )
+
+        return RiskDecision.approve(
+            risk_pct=adjusted_risk,
+            meta={
+                "default_risk_pct": self.default_risk_pct,
+                "agent_risk_adjustment": agent_decision.risk_adjustment,
+            },
+        )
+
+
+class NoopExecutionSimulator:
+    """
+    空执行模拟器。
+
+    当前仅用于先把主链路打通，不产生真实交易记录。
+    后续可替换为真正的成交仿真模块。
+    """
+
+    def execute(
+        self,
+        market_state,
+        signal,
+        risk_decision: RiskDecision,
+        portfolio_state: PortfolioState,
+    ) -> Optional[TradeRecord]:
+        return None
+
+
+class BacktestEngine:
+    """
+    回测主引擎。
+
+    当前职责：
+    1. 遍历回测步
+    2. 调用 Agent 评估
+    3. 调用风控审批
+    4. 调用执行模拟器
+    5. 汇总统计结果
+
+    注意：
+    当前版本重点在于打通“主链路”，
+    不追求一次性实现完整成交仿真细节。
+    """
+
+    def __init__(
+        self,
+        agent: BaseAgent,
+        risk_manager: Optional[RiskManager] = None,
+        execution_simulator: Optional[ExecutionSimulator] = None,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        self.agent = agent
+        self.risk_manager = risk_manager or DefaultRiskManager()
+        self.execution_simulator = execution_simulator or NoopExecutionSimulator()
+        self.logger = logger or self._build_logger()
+
+    @staticmethod
+    def _build_logger() -> logging.Logger:
+        """
+        创建默认日志对象。
+
+        日志打印统一使用中文，方便后续排查。
+        """
+        logger = logging.getLogger("dpaitrade.backtest")
+        if logger.handlers:
+            return logger
+
+        logger.setLevel(logging.INFO)
+
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter(
+            fmt="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.propagate = False
+        return logger
+
+    def run(
+        self,
+        steps: Iterable[BacktestStep],
+        initial_portfolio: Optional[PortfolioState] = None,
+    ) -> BacktestResult:
+        """
+        执行回测。
+
+        参数：
+        - steps: 回测步序列
+        - initial_portfolio: 初始账户状态
+
+        返回：
+        - BacktestResult
+        """
+        initial_portfolio = initial_portfolio or PortfolioState(
+            cash=10000.0,
+            equity=10000.0,
+        )
+
+        portfolio_state = replace(initial_portfolio)
+
+        started_at = datetime.now()
+        result = BacktestResult(
+            started_at=started_at,
+            finished_at=started_at,
+            initial_equity=portfolio_state.equity,
+            final_equity=portfolio_state.equity,
+        )
+
+        self.logger.info("开始执行回测，初始资金：%.2f", portfolio_state.equity)
+        self.logger.info("当前 Agent：%s", self.agent.name)
+
+        for idx, step in enumerate(steps, start=1):
+            result.total_steps += 1
+
+            market_state = step.market_state
+            signal = step.candidate_signal
+            step_portfolio_state = step.portfolio_state or portfolio_state
+
+            self.logger.info(
+                "处理回测步[%s]，时间=%s，品种=%s，D1状态=%s，D1偏置=%s",
+                idx,
+                market_state.ts,
+                market_state.symbol,
+                market_state.d1_regime,
+                market_state.d1_bias,
+            )
+
+            if signal is None:
+                self.logger.info("当前回测步无候选信号，跳过")
+                continue
+
+            result.total_candidate_signals += 1
+            self.logger.info(
+                "发现候选信号：方向=%s，入场价=%.5f，止损=%.5f，预估RR=%.3f，原因=%s",
+                signal.direction,
+                signal.entry_price,
+                signal.stop_loss,
+                signal.rr_estimate,
+                signal.reason,
+            )
+
+            # --------------------------
+            # 第一步：Agent 过滤与评分
+            # --------------------------
+            agent_decision = self.agent.evaluate(
+                market_state=market_state,
+                signal=signal,
+                portfolio_state=step_portfolio_state,
+            )
+
+            self.logger.info(
+                "Agent 决策：allow_trade=%s，direction_bias=%s，setup_score=%.4f，"
+                "risk_adjustment=%.2f，原因=%s",
+                agent_decision.allow_trade,
+                agent_decision.direction_bias,
+                agent_decision.setup_score,
+                agent_decision.risk_adjustment,
+                agent_decision.reason,
+            )
+
+            if not agent_decision.allow_trade:
+                result.total_agent_rejected += 1
+                self.logger.info("候选信号被 Agent 拒绝，进入下一步")
+                continue
+
+            # --------------------------
+            # 第二步：风控审批
+            # --------------------------
+            risk_decision = self.risk_manager.review(
+                market_state=market_state,
+                signal=signal,
+                agent_decision=agent_decision,
+                portfolio_state=step_portfolio_state,
+            )
+
+            self.logger.info(
+                "风控审批结果：approved=%s，risk_pct=%.4f，原因=%s",
+                risk_decision.approved,
+                risk_decision.risk_pct,
+                risk_decision.reject_reason or "通过",
+            )
+
+            if not risk_decision.approved:
+                result.total_risk_rejected += 1
+                self.logger.info("候选信号被风控拒绝，进入下一步")
+                continue
+
+            # --------------------------
+            # 第三步：执行模拟
+            # --------------------------
+            trade_record = self.execution_simulator.execute(
+                market_state=market_state,
+                signal=signal,
+                risk_decision=risk_decision,
+                portfolio_state=step_portfolio_state,
+            )
+
+            if trade_record is None:
+                self.logger.info("本步未形成成交记录，进入下一步")
+                continue
+
+            result.trade_records.append(trade_record)
+            result.total_trades += 1
+
+            self._apply_trade_record(
+                portfolio_state=portfolio_state,
+                trade_record=trade_record,
+                risk_pct=risk_decision.risk_pct,
+            )
+
+            self.logger.info(
+                "成交记录已写入：方向=%s，净盈亏=%.2f，R值=%.2f，当前权益=%.2f",
+                trade_record.direction,
+                trade_record.pnl,
+                trade_record.pnl_r,
+                portfolio_state.equity,
+            )
+
+        # 回测结束，计算汇总指标
+        result.finished_at = datetime.now()
+        result.final_equity = portfolio_state.equity
+        result.net_pnl = result.final_equity - result.initial_equity
+
+        self._finalize_metrics(result=result, initial_equity=result.initial_equity)
+
+        self.logger.info("回测结束")
+        self.logger.info(
+            "结果汇总：总步数=%s，候选信号=%s，Agent拒绝=%s，风控拒绝=%s，成交笔数=%s，净盈亏=%.2f",
+            result.total_steps,
+            result.total_candidate_signals,
+            result.total_agent_rejected,
+            result.total_risk_rejected,
+            result.total_trades,
+            result.net_pnl,
+        )
+
+        return result
+
+    def _apply_trade_record(
+        self,
+        portfolio_state: PortfolioState,
+        trade_record: TradeRecord,
+        risk_pct: float,
+    ) -> None:
+        """
+        将成交记录反映到账户状态中。
+
+        当前先做最基础更新：
+        - 资金
+        - 权益
+        - 连续亏损次数
+        - 当前风险占用（简化处理）
+
+        后续可以扩展：
+        - 已开仓列表
+        - 日内亏损限制
+        - 最大回撤跟踪
+        """
+        portfolio_state.cash += trade_record.pnl
+        portfolio_state.equity += trade_record.pnl
+        portfolio_state.used_risk_pct = max(0.0, portfolio_state.used_risk_pct - risk_pct)
+
+        if trade_record.pnl < 0:
+            portfolio_state.consecutive_losses += 1
+        else:
+            portfolio_state.consecutive_losses = 0
+
+    def _finalize_metrics(self, result: BacktestResult, initial_equity: float) -> None:
+        """
+        计算回测汇总指标。
+        """
+        trades = result.trade_records
+        if not trades:
+            result.win_rate = 0.0
+            result.profit_factor = 0.0
+            result.max_drawdown_pct = 0.0
+            return
+
+        wins = [t for t in trades if t.pnl > 0]
+        losses = [t for t in trades if t.pnl < 0]
+
+        result.win_rate = len(wins) / len(trades)
+
+        gross_profit = sum(t.pnl for t in wins)
+        gross_loss = abs(sum(t.pnl for t in losses))
+
+        if gross_loss == 0:
+            result.profit_factor = float("inf") if gross_profit > 0 else 0.0
+        else:
+            result.profit_factor = gross_profit / gross_loss
+
+        result.max_drawdown_pct = self._calculate_max_drawdown_pct(
+            initial_equity=initial_equity,
+            trades=trades,
+        )
+
+    def _calculate_max_drawdown_pct(
+        self,
+        initial_equity: float,
+        trades: list[TradeRecord],
+    ) -> float:
+        """
+        根据成交记录计算最大回撤百分比。
+
+        当前为基于已实现净盈亏的简化计算。
+        """
+        peak = initial_equity
+        equity = initial_equity
+        max_drawdown = 0.0
+
+        for trade in trades:
+            equity += trade.pnl
+            if equity > peak:
+                peak = equity
+
+            if peak <= 0:
+                continue
+
+            drawdown = (peak - equity) / peak
+            if drawdown > max_drawdown:
+                max_drawdown = drawdown
+
+        return max_drawdown
