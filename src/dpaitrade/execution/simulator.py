@@ -11,36 +11,42 @@ from dpaitrade.core.types import CandidateSignal, MarketState, PortfolioState, R
 @dataclass(slots=True)
 class SimulationConfig:
     """
-    执行模拟配置。
+    执行模拟配置（H4结构 trailing 版）。
 
-    当前版本先做“单步近似成交模拟”：
-    - 通过 market_state.meta 中预先提供的 future_high / future_low / future_close
-      来模拟本次候选信号后续的价格表现
-    - 若未来价格先到达止盈或止损，则按命中处理
-    - 若都未命中，则按 future_close 平仓
-
-    这是为了先把回测主链路打通。
-    后续可以升级为：
-    - 多 bar 持仓生命周期
-    - 分批止盈
-    - 移动止损
-    - 滑点与手续费的更细建模
+    逻辑：
+    1. 初始止损
+    2. 最大浮盈达到 1.5R 后，止损移到保本
+    3. 保本后，仅允许 H4 结构 trailing stop 收紧
+    4. H4 波段失效离场
+    5. 到期按 future_close 平仓
     """
 
     fee_rate: float = 0.0002
     slippage: float = 0.0
-    default_holding_minutes: int = 15
+
     fallback_exit_to_entry: bool = True
+    default_holding_minutes: int = 15
+
+    # 达到 1.5R 后移到保本
+    break_even_trigger_r: float = 1.5
+    break_even_offset: float = 0.0
+
+    # H4 trailing stop
+    h4_bar_hours: int = 4
+    trailing_buffer_atr_ratio: float = 0.10
+    trailing_buffer_spread_multiple: float = 1.0
+
+    # H4 失效离场确认
+    h4_invalid_confirm_bars: int = 2
 
 
 class SimpleExecutionSimulator:
     """
-    简单执行模拟器。
+    顺势执行模拟器（H4 trailing 版）。
 
-    设计说明：
-    - 当前用于第一版工程链路验证
-    - 它不追求完整市场微观结构，只追求“可测、可扩展、能出交易记录”
-    - 后续你可以用更严格的逐 bar / 逐 tick 模拟器替换它
+    注意：
+    - M15 不再参与离场
+    - H4 负责波段结构 trailing 与失效离场
     """
 
     def __init__(
@@ -75,13 +81,6 @@ class SimpleExecutionSimulator:
         risk_decision: RiskDecision,
         portfolio_state: PortfolioState,
     ) -> Optional[TradeRecord]:
-        """
-        执行一次近似交易模拟。
-
-        约定：
-        - future_high / future_low / future_close 从 market_state.meta 中读取
-        - 若缺失这些字段，则按 fallback 逻辑处理
-        """
         if not risk_decision.approved:
             self.logger.info("执行模拟跳过：风控未通过")
             return None
@@ -95,59 +94,163 @@ class SimpleExecutionSimulator:
             stop_loss=signal.stop_loss,
             equity=portfolio_state.equity,
             risk_pct=risk_decision.risk_pct,
-            direction=signal.direction,
         )
         if quantity <= 0:
             self.logger.info("执行模拟跳过：计算出的下单数量小于等于 0")
             return None
 
-        future_high = market_state.meta.get("future_high")
-        future_low = market_state.meta.get("future_low")
-        future_close = market_state.meta.get("future_close")
+        future_bars = market_state.meta.get("future_bars", [])
+        h4_exec_bars = market_state.meta.get("h4_exec_bars", [])
+        if not future_bars:
+            return self._fallback_execute_with_legacy_fields(
+                market_state=market_state,
+                signal=signal,
+                risk_decision=risk_decision,
+                portfolio_state=portfolio_state,
+                quantity=quantity,
+            )
+
+        entry_price = signal.entry_price
+        initial_stop = signal.stop_loss
+        current_stop = initial_stop
+        initial_risk = abs(entry_price - initial_stop)
+
+        if initial_risk <= 0:
+            self.logger.info("执行模拟跳过：初始风险距离无效")
+            return None
+
+        atr = float(market_state.atr or 0.0)
+        spread = float(market_state.spread or 0.0)
+
+        trailing_buffer = max(
+            atr * self.config.trailing_buffer_atr_ratio,
+            spread * self.config.trailing_buffer_spread_multiple,
+        )
+
+        break_even_armed = False
+        m15_history: list[dict] = []
 
         exit_price: Optional[float] = None
         close_reason = ""
+        close_time: Optional[datetime] = None
 
-        # 对多头：
-        # 先检查 future_low 是否触发止损，再检查 future_high 是否触发止盈。
-        # 这里是一种偏保守处理，默认先止损后止盈，避免回测过于乐观。
-        if signal.direction == "long":
-            if future_low is not None and future_low <= signal.stop_loss:
-                exit_price = signal.stop_loss - self.config.slippage
-                close_reason = "命中止损"
-            elif signal.take_profit is not None and future_high is not None and future_high >= signal.take_profit:
-                exit_price = signal.take_profit - self.config.slippage
-                close_reason = "命中止盈"
+        mid_tf_state = market_state.meta.get("h4_state")
 
-        # 对空头：
-        # 同样采用偏保守顺序，默认先检查止损，再检查止盈。
-        else:
-            if future_high is not None and future_high >= signal.stop_loss:
-                exit_price = signal.stop_loss + self.config.slippage
-                close_reason = "命中止损"
-            elif signal.take_profit is not None and future_low is not None and future_low <= signal.take_profit:
-                exit_price = signal.take_profit + self.config.slippage
-                close_reason = "命中止盈"
+        for bar in future_bars:
+            bar_ts = bar["ts"]
+            bar_open = float(bar["open"])
+            bar_high = float(bar["high"])
+            bar_low = float(bar["low"])
+            bar_close = float(bar["close"])
 
+            # 1) 当前 stop 是否被打到
+            if signal.direction == "short":
+                if bar_high >= current_stop:
+                    exit_price = current_stop + self.config.slippage
+                    close_time = bar_ts
+                    if self._is_break_even_stop(current_stop, entry_price):
+                        close_reason = "保本止损"
+                    elif current_stop != initial_stop:
+                        close_reason = "移动止损"
+                    else:
+                        close_reason = "命中止损"
+                    break
+            else:
+                if bar_low <= current_stop:
+                    exit_price = current_stop - self.config.slippage
+                    close_time = bar_ts
+                    if self._is_break_even_stop(current_stop, entry_price):
+                        close_reason = "保本止损"
+                    elif current_stop != initial_stop:
+                        close_reason = "移动止损"
+                    else:
+                        close_reason = "命中止损"
+                    break
+
+            # 更新 M15 路径历史（仅用于浮盈计算，不用于离场）
+            m15_history.append(
+                {
+                    "ts": bar_ts,
+                    "open": bar_open,
+                    "high": bar_high,
+                    "low": bar_low,
+                    "close": bar_close,
+                }
+            )
+
+            # 2) 最大浮盈达到 1.5R 后移到保本
+            if not break_even_armed:
+                max_favorable_move = self._calc_max_favorable_move(
+                    direction=signal.direction,
+                    entry_price=entry_price,
+                    history=m15_history,
+                )
+                if max_favorable_move >= initial_risk * self.config.break_even_trigger_r:
+                    break_even_armed = True
+                    current_stop = self._break_even_price(entry_price, signal.direction)
+                    self.logger.info(
+                        "触发保本：direction=%s，entry=%.5f，new_stop=%.5f，达到%.2fR",
+                        signal.direction,
+                        entry_price,
+                        current_stop,
+                        self.config.break_even_trigger_r,
+                    )
+
+            # 3) 获取当前时刻之前“已完成”的 H4 bars
+            closed_h4_bars = self._collect_closed_h4_bars(
+                h4_exec_bars=h4_exec_bars,
+                current_ts=bar_ts,
+            )
+
+            # 4) 保本后，只允许 H4 结构 trailing
+            if break_even_armed:
+                new_stop = self._calc_h4_trailing_stop(
+                    closed_h4_bars=closed_h4_bars,
+                    direction=signal.direction,
+                    current_stop=current_stop,
+                    trailing_buffer=trailing_buffer,
+                )
+                if new_stop is not None:
+                    current_stop = new_stop
+
+            # 5) H4 失效离场（不依赖 M15）
+            if self._detect_h4_invalidation_exit(
+                direction=signal.direction,
+                closed_h4_bars=closed_h4_bars,
+                mid_tf_state=mid_tf_state,
+            ):
+                exit_price = (
+                    bar_close + self.config.slippage
+                    if signal.direction == "short"
+                    else bar_close - self.config.slippage
+                )
+                close_time = bar_ts
+                close_reason = "H4失效离场"
+                break
+
+        # 6) 到期按最后一根 future_close 离场
         if exit_price is None:
-            if future_close is not None:
-                exit_price = float(future_close)
+            if future_bars:
+                last_bar = future_bars[-1]
+                exit_price = float(last_bar["close"])
+                close_time = last_bar["ts"]
                 close_reason = "到期按 future_close 平仓"
             elif self.config.fallback_exit_to_entry:
-                exit_price = signal.entry_price
+                exit_price = entry_price
+                close_time = market_state.ts + timedelta(minutes=self.config.default_holding_minutes)
                 close_reason = "缺少未来价格数据，按入场价平仓"
             else:
-                self.logger.info("执行模拟跳过：缺少未来价格数据，且未启用 fallback")
+                self.logger.info("执行模拟跳过：缺少未来路径，且未启用 fallback")
                 return None
 
         fees = self._calculate_fees(
-            entry_price=signal.entry_price,
+            entry_price=entry_price,
             exit_price=exit_price,
             quantity=quantity,
         )
         pnl = self._calculate_pnl(
             direction=signal.direction,
-            entry_price=signal.entry_price,
+            entry_price=entry_price,
             exit_price=exit_price,
             quantity=quantity,
             fees=fees,
@@ -161,12 +264,167 @@ class SimpleExecutionSimulator:
         self.logger.info(
             "执行模拟完成：direction=%s，entry=%.5f，exit=%.5f，quantity=%.5f，pnl=%.2f，close_reason=%s",
             signal.direction,
-            signal.entry_price,
+            entry_price,
             exit_price,
             quantity,
             pnl,
             close_reason,
         )
+
+        return TradeRecord(
+            symbol=signal.symbol,
+            direction=signal.direction,
+            open_time=market_state.ts,
+            close_time=close_time or self._estimate_close_time(market_state.ts),
+            entry_price=entry_price,
+            exit_price=exit_price,
+            quantity=quantity,
+            pnl=pnl,
+            pnl_r=pnl_r,
+            fees=fees,
+            open_reason=signal.reason,
+            close_reason=close_reason,
+            meta={
+                "risk_pct": risk_decision.risk_pct,
+                "initial_stop": initial_stop,
+                "final_stop": current_stop,
+                "break_even_armed": break_even_armed,
+            },
+        )
+
+    def _collect_closed_h4_bars(self, h4_exec_bars: list[dict], current_ts: datetime) -> list[dict]:
+        """
+        收集当前时刻之前已经完成的 H4 bars。
+
+        约定：
+        - h4_exec_bars 中的 ts 是 H4 bar 的开盘时间
+        - 只有 ts + 4h <= current_ts，才认为该 H4 bar 已完成
+        """
+        closed: list[dict] = []
+        for bar in h4_exec_bars:
+            bar_end = bar["ts"] + timedelta(hours=self.config.h4_bar_hours)
+            if bar_end <= current_ts:
+                closed.append(bar)
+        return closed
+
+    def _calc_max_favorable_move(
+        self,
+        direction: str,
+        entry_price: float,
+        history: list[dict],
+    ) -> float:
+        if direction == "short":
+            return entry_price - min(h["low"] for h in history)
+        return max(h["high"] for h in history) - entry_price
+
+    def _break_even_price(self, entry_price: float, direction: str) -> float:
+        if direction == "short":
+            return entry_price - self.config.break_even_offset
+        return entry_price + self.config.break_even_offset
+
+    @staticmethod
+    def _is_break_even_stop(current_stop: float, entry_price: float) -> bool:
+        return abs(current_stop - entry_price) < 1e-8
+
+    def _calc_h4_trailing_stop(
+        self,
+        closed_h4_bars: list[dict],
+        direction: str,
+        current_stop: float,
+        trailing_buffer: float,
+    ) -> Optional[float]:
+        """
+        H4 结构 trailing stop：
+
+        short:
+        - 用最近一根已完成 H4 bar 的高点 + buffer 作为新的结构止损
+        - 仅允许向下收紧
+
+        long:
+        - 用最近一根已完成 H4 bar 的低点 - buffer
+        - 仅允许向上收紧
+        """
+        if not closed_h4_bars:
+            return None
+
+        last_closed = closed_h4_bars[-1]
+
+        if direction == "short":
+            candidate = float(last_closed["high"]) + trailing_buffer
+            return candidate if candidate < current_stop else current_stop
+
+        candidate = float(last_closed["low"]) - trailing_buffer
+        return candidate if candidate > current_stop else current_stop
+
+    def _detect_h4_invalidation_exit(self, direction: str, closed_h4_bars: list[dict], mid_tf_state) -> bool:
+        """
+        H4 波段失效离场：
+
+        short:
+        - 连续 N 根已完成 H4 收盘 > constraint_upper + tolerance
+
+        long:
+        - 连续 N 根已完成 H4 收盘 < constraint_lower - tolerance
+        """
+        if mid_tf_state is None:
+            return False
+
+        confirm_n = self.config.h4_invalid_confirm_bars
+        if len(closed_h4_bars) < confirm_n:
+            return False
+
+        recent = closed_h4_bars[-confirm_n:]
+
+        upper = getattr(mid_tf_state, "constraint_upper", None)
+        lower = getattr(mid_tf_state, "constraint_lower", None)
+        tol = float(getattr(mid_tf_state, "boundary_tolerance", 0.0) or 0.0)
+
+        if direction == "short":
+            if upper is None:
+                return False
+            return all(float(bar["close"]) > upper + tol for bar in recent)
+
+        if lower is None:
+            return False
+        return all(float(bar["close"]) < lower - tol for bar in recent)
+
+    def _fallback_execute_with_legacy_fields(
+        self,
+        market_state: MarketState,
+        signal: CandidateSignal,
+        risk_decision: RiskDecision,
+        portfolio_state: PortfolioState,
+        quantity: float,
+    ) -> Optional[TradeRecord]:
+        future_high = market_state.meta.get("future_high")
+        future_low = market_state.meta.get("future_low")
+        future_close = market_state.meta.get("future_close")
+
+        exit_price: Optional[float] = None
+        close_reason = ""
+
+        if signal.direction == "long":
+            if future_low is not None and future_low <= signal.stop_loss:
+                exit_price = signal.stop_loss - self.config.slippage
+                close_reason = "命中止损"
+        else:
+            if future_high is not None and future_high >= signal.stop_loss:
+                exit_price = signal.stop_loss + self.config.slippage
+                close_reason = "命中止损"
+
+        if exit_price is None:
+            if future_close is not None:
+                exit_price = float(future_close)
+                close_reason = "到期按 future_close 平仓"
+            elif self.config.fallback_exit_to_entry:
+                exit_price = signal.entry_price
+                close_reason = "缺少未来价格数据，按入场价平仓"
+            else:
+                return None
+
+        fees = self._calculate_fees(signal.entry_price, exit_price, quantity)
+        pnl = self._calculate_pnl(signal.direction, signal.entry_price, exit_price, quantity, fees)
+        pnl_r = self._calculate_r_multiple(pnl, portfolio_state.equity, risk_decision.risk_pct)
 
         return TradeRecord(
             symbol=signal.symbol,
@@ -182,10 +440,8 @@ class SimpleExecutionSimulator:
             open_reason=signal.reason,
             close_reason=close_reason,
             meta={
-                "future_high": future_high,
-                "future_low": future_low,
-                "future_close": future_close,
                 "risk_pct": risk_decision.risk_pct,
+                "legacy_mode": True,
             },
         )
 
@@ -195,16 +451,7 @@ class SimpleExecutionSimulator:
         stop_loss: float,
         equity: float,
         risk_pct: float,
-        direction: str,
     ) -> float:
-        """
-        根据固定风险比例估算下单数量。
-
-        计算思路：
-        - 风险金额 = equity * risk_pct
-        - 单位风险 = |entry - stop_loss|
-        - 数量 = 风险金额 / 单位风险
-        """
         risk_amount = equity * max(risk_pct, 0.0)
         unit_risk = abs(entry_price - stop_loss)
         if unit_risk <= 0:
@@ -212,11 +459,6 @@ class SimpleExecutionSimulator:
         return round(risk_amount / unit_risk, 6)
 
     def _calculate_fees(self, entry_price: float, exit_price: float, quantity: float) -> float:
-        """
-        计算手续费。
-
-        当前采用非常简单的双边费率模型。
-        """
         turnover = (entry_price + exit_price) * quantity
         return turnover * self.config.fee_rate
 
@@ -228,9 +470,6 @@ class SimpleExecutionSimulator:
         quantity: float,
         fees: float,
     ) -> float:
-        """
-        计算净盈亏。
-        """
         if direction == "long":
             gross = (exit_price - entry_price) * quantity
         else:
@@ -239,20 +478,8 @@ class SimpleExecutionSimulator:
 
     @staticmethod
     def _calculate_r_multiple(pnl: float, equity: float, risk_pct: float) -> float:
-        """
-        计算 R 值。
-
-        当前定义：
-        - 1R = equity * risk_pct
-        """
         one_r = equity * max(risk_pct, 1e-8)
         return pnl / max(one_r, 1e-8)
 
     def _estimate_close_time(self, ts: datetime) -> datetime:
-        """
-        估算平仓时间。
-
-        由于当前是近似模拟，不追踪真实持仓生命周期，
-        因此默认给一个固定持仓时长。
-        """
         return ts + timedelta(minutes=self.config.default_holding_minutes)

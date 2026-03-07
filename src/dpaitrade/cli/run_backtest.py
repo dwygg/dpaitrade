@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
+from collections import defaultdict
 from pathlib import Path
 
 from dpaitrade.agent import PassthroughAgent, SimpleRuleFilterAgent
@@ -11,22 +11,15 @@ from dpaitrade.data import OHLCRow, load_ohlc_csv, slice_recent_rows
 from dpaitrade.execution import SimpleExecutionSimulator
 from dpaitrade.risk import GuardRiskManager, RiskGuardConfig
 from dpaitrade.strategy import (
-    D1Bar,
-    D1RegimeDetector,
-    H4Bar,
-    H4PullbackDetector,
-    M15Bar,
-    M15EntryDetector,
-    SignalBuildContext,
-    SignalBuilder,
+    StrategyContext,
+    TrendContinuationPolicy,
+    TrendContinuationPolicyConfig,
 )
-from collections import defaultdict
+from dpaitrade.structure import GenericBar, StructureAnalyzer, StructureAnalyzerConfig
+
 
 def parse_args() -> argparse.Namespace:
-    """
-    解析命令行参数。
-    """
-    parser = argparse.ArgumentParser(description="dpaitrade 多步 CSV 回测入口")
+    parser = argparse.ArgumentParser(description="dpaitrade 统一结构策略回测入口")
 
     parser.add_argument("--d1", type=str, required=True, help="D1 CSV 路径")
     parser.add_argument("--h4", type=str, required=True, help="H4 CSV 路径")
@@ -45,55 +38,61 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--future-window",
         type=int,
-        default=8,
+        default=64,
         help="执行模拟时，用后续多少根 M15 生成 future_high/future_low/future_close",
     )
 
-    # 各周期回看窗口
-    parser.add_argument("--d1-lookback", type=int, default=20, help="D1 回看窗口")
+    parser.add_argument("--d1-lookback", type=int, default=24, help="D1 回看窗口")
     parser.add_argument("--h4-lookback", type=int, default=24, help="H4 回看窗口")
-    parser.add_argument("--m15-lookback", type=int, default=12, help="M15 回看窗口")
+    parser.add_argument("--m15-lookback", type=int, default=24, help="M15 回看窗口")
 
+    parser.add_argument("--cooldown-steps", type=int, default=4, help="成交后冷却步数")
+
+    parser.add_argument("--allow-long", action="store_true", help="允许做多")
+    parser.add_argument("--allow-short", action="store_true", help="允许做空")
     return parser.parse_args()
 
 
-def to_d1_bars(rows: list[OHLCRow]) -> list[D1Bar]:
-    return [D1Bar(open=r.open, high=r.high, low=r.low, close=r.close) for r in rows]
+def to_generic_bars(rows: list[OHLCRow]) -> list[GenericBar]:
+    return [
+        GenericBar(
+            ts=r.ts,
+            open=r.open,
+            high=r.high,
+            low=r.low,
+            close=r.close,
+        )
+        for r in rows
+    ]
 
 
-def to_h4_bars(rows: list[OHLCRow]) -> list[H4Bar]:
-    return [H4Bar(open=r.open, high=r.high, low=r.low, close=r.close) for r in rows]
-
-
-def to_m15_bars(rows: list[OHLCRow]) -> list[M15Bar]:
-    return [M15Bar(open=r.open, high=r.high, low=r.low, close=r.close) for r in rows]
-
-
-def infer_future_prices(
+def build_future_path(
     m15_rows: list[OHLCRow],
     current_index: int,
     future_window: int,
-) -> tuple[float | None, float | None, float | None]:
-    """
-    用当前 M15 之后的 future_window 根 M15，推导 future_high / future_low / future_close。
-
-    返回：
-    - future_high
-    - future_low
-    - future_close
-    """
+) -> tuple[list[dict], float | None, float | None, float | None]:
     start = current_index + 1
     end = min(len(m15_rows), current_index + 1 + future_window)
     future_rows = m15_rows[start:end]
 
     if not future_rows:
-        return None, None, None
+        return [], None, None, None
+
+    future_bars = [
+        {
+            "ts": row.ts,
+            "open": row.open,
+            "high": row.high,
+            "low": row.low,
+            "close": row.close,
+        }
+        for row in future_rows
+    ]
 
     future_high = max(row.high for row in future_rows)
     future_low = min(row.low for row in future_rows)
     future_close = future_rows[-1].close
-    return future_high, future_low, future_close
-
+    return future_bars, future_high, future_low, future_close
 
 def build_backtest_steps_from_csv(
     d1_rows: list[OHLCRow],
@@ -104,35 +103,49 @@ def build_backtest_steps_from_csv(
     h4_lookback: int,
     m15_lookback: int,
     future_window: int,
+    allow_long: bool,
+    allow_short: bool,
     limit: int = 0,
 ) -> list[BacktestStep]:
-    """
-    从三份 CSV 数据构造多步回测输入。
-
-    规则：
-    - 以 M15 为主循环
-    - 每一步取“当前时刻之前”的最近 D1/H4/M15 窗口
-    - 用这些窗口生成 MarketState 与 CandidateSignal
-    - 再把未来 N 根 M15 的高低收，放入 market_state.meta 给执行模拟器使用
-    """
     print("[信息] 开始构造多步回测数据")
 
-    d1_detector = D1RegimeDetector(
-        lookback=d1_lookback,
-        trend_threshold=0.18,
-        range_threshold=0.08,
+    d1_analyzer = StructureAnalyzer(
+        StructureAnalyzerConfig(
+            timeframe="D1",
+            min_bars=d1_lookback,
+            lookback=d1_lookback,
+            swing_window=2,
+            trend_threshold=0.38,
+            range_threshold=0.58,
+        )
     )
-    h4_detector = H4PullbackDetector(
-        swing_lookback=h4_lookback,
-        pullback_min_ratio=0.25,
-        pullback_max_ratio=0.70,
-        boundary_near_ratio=0.15,
+    h4_analyzer = StructureAnalyzer(
+        StructureAnalyzerConfig(
+            timeframe="H4",
+            min_bars=h4_lookback,
+            lookback=h4_lookback,
+            swing_window=2,
+            trend_threshold=0.36,
+            range_threshold=0.60,
+        )
     )
-    m15_detector = M15EntryDetector(
-        structure_lookback=m15_lookback,
-        min_rr=1.5,
+    m15_analyzer = StructureAnalyzer(
+        StructureAnalyzerConfig(
+            timeframe="M15",
+            min_bars=m15_lookback,
+            lookback=m15_lookback,
+            swing_window=2,
+            trend_threshold=0.34,
+            range_threshold=0.60,
+        )
     )
-    signal_builder = SignalBuilder()
+
+    policy = TrendContinuationPolicy(
+        TrendContinuationPolicyConfig(
+            allow_long=allow_long,
+            allow_short=allow_short,
+        )
+    )
 
     d1_ts = [r.ts for r in d1_rows]
     h4_ts = [r.ts for r in h4_rows]
@@ -148,7 +161,6 @@ def build_backtest_steps_from_csv(
         h4_window_rows = slice_recent_rows(h4_rows, h4_ts, current_ts, h4_lookback)
         m15_window_rows = slice_recent_rows(m15_rows, m15_ts, current_ts, m15_lookback)
 
-        # 窗口不足时，跳过
         if len(d1_window_rows) < d1_lookback:
             continue
         if len(h4_window_rows) < h4_lookback:
@@ -156,46 +168,62 @@ def build_backtest_steps_from_csv(
         if len(m15_window_rows) < m15_lookback:
             continue
 
-        d1_result = d1_detector.detect(to_d1_bars(d1_window_rows))
-        h4_result = h4_detector.detect(
-            to_h4_bars(h4_window_rows),
-            d1_regime=d1_result.regime,
-            d1_bias=d1_result.bias,
-        )
-        m15_result = m15_detector.detect(
-            to_m15_bars(m15_window_rows),
-            preferred_direction=h4_result.preferred_direction,
-        )
-
-        # spread / atr / volatility_score 优先从当前 m15 行 meta 中读取
         atr = float(current_m15.meta.get("atr", 0.0) or 0.0)
         spread = float(current_m15.meta.get("spread", 0.0) or 0.0)
         volatility_score = float(current_m15.meta.get("volatility_score", 0.0) or 0.0)
 
-        ctx = SignalBuildContext(
+        d1_state = d1_analyzer.analyze(to_generic_bars(d1_window_rows))
+        h4_state = h4_analyzer.analyze(to_generic_bars(h4_window_rows))
+        m15_state = m15_analyzer.analyze(to_generic_bars(m15_window_rows))
+
+        ctx = StrategyContext(
             ts=current_ts,
             symbol=symbol,
+            entry_price=current_m15.close,
             atr=atr,
             spread=spread,
             volatility_score=volatility_score,
+            mid_price=h4_window_rows[-1].close if h4_window_rows else current_m15.close,
+            low_tf_bars=to_generic_bars(m15_window_rows),
         )
 
-        market_state = signal_builder.build_market_state(ctx, d1_result, h4_result, m15_result)
+        candidate_signal = policy.generate_signal(
+            high_tf=d1_state,
+            mid_tf=h4_state,
+            low_tf=m15_state,
+            ctx=ctx,
+        )
 
-        future_high, future_low, future_close = infer_future_prices(
+        future_bars, future_high, future_low, future_close = build_future_path(
             m15_rows=m15_rows,
             current_index=idx,
             future_window=future_window,
         )
-        market_state.meta["future_high"] = future_high
-        market_state.meta["future_low"] = future_low
-        market_state.meta["future_close"] = future_close
 
-        candidate_signal = signal_builder.build_candidate_signal(
-            ctx,
-            d1_result,
-            h4_result,
-            m15_result,
+        h4_exec_bars = build_h4_execution_path(
+                h4_rows=h4_rows,
+                current_ts=current_ts,
+                history_window=h4_lookback,
+                forward_window=max(8, future_window // 4 + 2),
+        )
+        # 使用 D1 作为主市场状态，中周期/低周期状态写入 meta，供后续分析使用
+        market_state = _build_market_state_from_structure(
+            symbol=symbol,
+            state=d1_state,
+            current_ts=current_ts,
+            atr=atr,
+            spread=spread,
+            volatility_score=volatility_score,
+
+            extra_meta={
+                "h4_state": h4_state,
+                "m15_state": m15_state,
+                "h4_exec_bars": h4_exec_bars,
+                "future_bars": future_bars,
+                "future_high": future_high,
+                "future_low": future_low,
+                "future_close": future_close,
+            },
         )
 
         step = BacktestStep(
@@ -213,62 +241,102 @@ def build_backtest_steps_from_csv(
     return steps
 
 
+def _build_market_state_from_structure(
+    symbol: str,
+    state,
+    current_ts,
+    atr: float,
+    spread: float,
+    volatility_score: float,
+    extra_meta: dict,
+):
+    from dpaitrade.core import MarketState
+
+    d1_regime = "trend" if state.phase in ("impulse", "pullback") else ("range" if state.phase == "range" else "unknown")
+    d1_bias = state.primary_bias
+
+    market_state = MarketState(
+        ts=current_ts,
+        symbol=symbol,
+        d1_regime=d1_regime,
+        d1_bias=d1_bias if d1_bias in ("long", "short", "neutral") else "neutral",
+        h4_pullback_active=False,
+        h4_boundary_zone=False,
+        m15_entry_ready=False,
+        m15_entry_direction="neutral",
+        atr=atr,
+        spread=spread,
+        volatility_score=volatility_score,
+        meta={
+            "structure_state": state,
+            **extra_meta,
+        },
+    )
+    return market_state
+
+def build_h4_execution_path(
+    h4_rows: list[OHLCRow],
+    current_ts,
+    history_window: int = 24,
+    forward_window: int = 8,
+) -> list[dict]:
+    """
+    为执行模拟器构造 H4 路径：
+    - 包含当前时刻之前的历史 H4 bars
+    - 以及当前时刻之后的未来 H4 bars
+
+    用途：
+    - 让模拟器在持仓过程中按“已完成 H4 bar”更新 trailing stop
+    - 判断 H4 波段失效
+    """
+    history = [r for r in h4_rows if r.ts <= current_ts]
+    future = [r for r in h4_rows if r.ts > current_ts]
+
+    history = history[-history_window:]
+    future = future[:forward_window]
+
+    rows = history + future
+    return [
+        {
+            "ts": r.ts,
+            "open": r.open,
+            "high": r.high,
+            "low": r.low,
+            "close": r.close,
+        }
+        for r in rows
+    ]
+
+
 def build_agent(agent_name: str):
-    """
-    根据参数创建代理。
-    """
     if agent_name == "passthrough":
         print("[信息] 当前使用代理：直通代理")
         return PassthroughAgent()
 
     print("[信息] 当前使用代理：简单规则过滤代理")
     return SimpleRuleFilterAgent(
-        min_rr=1.2,
+        min_rr=0.0,
         max_spread=100000.0,
-        min_volatility_score=0.2,
-        reject_when_direction_conflict=True,
+        min_volatility_score=0.0,
+        reject_when_direction_conflict=False,
     )
 
 
-
-
 def _safe_div(a: float, b: float) -> float:
-    """
-    安全除法，避免分母为 0。
-    """
     if b == 0:
         return 0.0
     return a / b
 
 
 def _infer_regime_from_open_reason(open_reason: str) -> str:
-    """
-    从 open_reason 里推断信号来源场景。
-
-    当前阶段先使用字符串判断：
-    - 包含“趋势候选信号” -> trend
-    - 包含“边界候选信号” -> range
-    - 否则 -> unknown
-
-    后续更推荐把 regime 直接写入 TradeRecord.meta。
-    """
-    if "趋势候选信号" in open_reason:
+    if "趋势延续空头候选信号" in open_reason:
         return "trend"
-    if "边界候选信号" in open_reason:
-        return "range"
+    if "趋势延续多头候选信号" in open_reason:
+        return "trend"
     return "unknown"
 
 
 def build_trade_breakdown(trade_records: list) -> dict:
-    """
-    构建成交记录拆解统计。
-
-    输出结构包括：
-    - close_reason 维度统计
-    - direction 维度统计
-    - regime 维度统计
-    - 全局平均 pnl / pnl_r
-    """
     stats: dict = {
         "total_trades": len(trade_records),
         "avg_pnl": 0.0,
@@ -331,17 +399,14 @@ def build_trade_breakdown(trade_records: list) -> dict:
     stats["avg_pnl"] = total_pnl / len(trade_records)
     stats["avg_pnl_r"] = total_pnl_r / len(trade_records)
 
-    # 计算各桶平均值
     for section in ("close_reason", "direction", "regime"):
         for _, bucket in stats[section].items():
             bucket["avg_pnl_r"] = _safe_div(bucket["sum_pnl_r"], bucket["count"])
 
     return stats
 
+
 def print_trade_breakdown(result) -> None:
-    """
-    打印回测结果拆解统计。
-    """
     stats = build_trade_breakdown(result.trade_records)
 
     print("\n========== 结果拆解统计 ==========")
@@ -387,9 +452,6 @@ def print_trade_breakdown(result) -> None:
 
 
 def print_result(result) -> None:
-    """
-    打印回测结果。
-    """
     print("\n========== 回测结果 ==========")
     print(f"总步数：{result.total_steps}")
     print(f"候选信号数：{result.total_candidate_signals}")
@@ -415,13 +477,11 @@ def print_result(result) -> None:
             )
     else:
         print("\n[信息] 本次回测没有成交记录")
-    # 新增：打印拆解统计
+
     print_trade_breakdown(result)
 
+
 def main() -> None:
-    """
-    主入口。
-    """
     args = parse_args()
 
     print("[信息] 开始加载 CSV 数据")
@@ -435,6 +495,9 @@ def main() -> None:
     if not d1_rows or not h4_rows or not m15_rows:
         raise RuntimeError("CSV 数据为空，无法回测")
 
+    allow_long = args.allow_long
+    allow_short = args.allow_short or (not args.allow_long)
+
     steps = build_backtest_steps_from_csv(
         d1_rows=d1_rows,
         h4_rows=h4_rows,
@@ -444,10 +507,12 @@ def main() -> None:
         h4_lookback=args.h4_lookback,
         m15_lookback=args.m15_lookback,
         future_window=args.future_window,
+        allow_long=allow_long,
+        allow_short=allow_short,
         limit=args.limit,
     )
     if not steps:
-        raise RuntimeError("未生成任何回测步，请检查 CSV 数据长度或 lookback 参数")
+        raise RuntimeError("未生成任何回测步，请检查 CSV 数据长度或参数设置")
 
     agent = build_agent(args.agent)
 
@@ -457,12 +522,12 @@ def main() -> None:
             max_risk_pct_per_trade=0.01,
             max_used_risk_pct=0.02,
             max_consecutive_losses=100,
-            max_daily_loss_pct=0.02,
+            max_daily_loss_pct=0.99,
             max_open_positions=1,
             max_spread=200.0,
-            min_setup_score=0.45,
-            min_rr=1.2,
-            reject_direction_conflict=True,
+            min_setup_score=0.0,
+            min_rr=0.0,
+            reject_direction_conflict=False,
         )
     )
     simulator = SimpleExecutionSimulator()
@@ -470,7 +535,7 @@ def main() -> None:
         agent=agent,
         risk_manager=risk_manager,
         execution_simulator=simulator,
-        cooldown_steps=4,
+        cooldown_steps=args.cooldown_steps,
     )
 
     result = engine.run(
