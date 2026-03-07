@@ -1,0 +1,49 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 打包 / 安装产物
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+
+# 测试 / 覆盖率
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# 类型检查 / lint
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE / 编辑器
+.vscode/
+.idea/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
+
+# 本地数据（按需调整）
+data/raw/
+data/processed/
+
+# 临时文件
+*.tmp
+*.temp
