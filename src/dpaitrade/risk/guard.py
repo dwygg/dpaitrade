@@ -21,7 +21,7 @@ class RiskGuardConfig:
     default_risk_pct: float = 0.005
     max_risk_pct_per_trade: float = 0.01
     max_used_risk_pct: float = 0.02
-    max_consecutive_losses: int = 3
+    max_consecutive_losses: int = 100
     max_daily_loss_pct: float = 0.02
     max_open_positions: int = 1
     max_spread: float = 5.0

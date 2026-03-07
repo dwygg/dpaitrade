@@ -73,7 +73,7 @@ class DefaultRiskManager:
         default_risk_pct: float = 0.005,
         max_used_risk_pct: float = 0.02,
         max_consecutive_losses: int = 3,
-        max_spread: float = 5.0,
+        max_spread: float = 200.0,
     ) -> None:
         self.default_risk_pct = default_risk_pct
         self.max_used_risk_pct = max_used_risk_pct
@@ -179,11 +179,13 @@ class BacktestEngine:
         risk_manager: Optional[RiskManager] = None,
         execution_simulator: Optional[ExecutionSimulator] = None,
         logger: Optional[logging.Logger] = None,
+        cooldown_steps: int = 0,
     ) -> None:
         self.agent = agent
         self.risk_manager = risk_manager or DefaultRiskManager()
         self.execution_simulator = execution_simulator or NoopExecutionSimulator()
         self.logger = logger or self._build_logger()
+        self.cooldown_steps = max(0, cooldown_steps)
 
     @staticmethod
     def _build_logger() -> logging.Logger:
@@ -238,6 +240,7 @@ class BacktestEngine:
             final_equity=portfolio_state.equity,
         )
 
+        cooldown_remaining = 0
         self.logger.info("开始执行回测，初始资金：%.2f", portfolio_state.equity)
         self.logger.info("当前 Agent：%s", self.agent.name)
 
@@ -257,6 +260,13 @@ class BacktestEngine:
                 market_state.d1_bias,
             )
 
+            if cooldown_remaining > 0:
+                self.logger.info(
+                    "当前处于冷却期，剩余步数=%s，跳过本步信号判断",
+                    cooldown_remaining,
+                )
+                cooldown_remaining -= 1
+                continue
             if signal is None:
                 self.logger.info("当前回测步无候选信号，跳过")
                 continue
@@ -339,7 +349,10 @@ class BacktestEngine:
                 trade_record=trade_record,
                 risk_pct=risk_decision.risk_pct,
             )
-
+            if self.cooldown_steps > 0:
+                cooldown_remaining = self.cooldown_steps
+                self.logger.info("成交后进入冷却期，冷却步数=%s", self.cooldown_steps)
+                
             self.logger.info(
                 "成交记录已写入：方向=%s，净盈亏=%.2f，R值=%.2f，当前权益=%.2f",
                 trade_record.direction,
