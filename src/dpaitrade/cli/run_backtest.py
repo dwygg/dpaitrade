@@ -66,6 +66,26 @@ def to_generic_bars(rows: list[OHLCRow]) -> list[GenericBar]:
     ]
 
 
+def estimate_atr_from_rows(rows: list[OHLCRow], period: int = 14) -> float:
+    """
+    当 CSV 没有 atr 列时，用最近 period 根 M15 估算一个 ATR，
+    避免策略中的 ATR 距离保护退化成接近 0。
+    """
+    if len(rows) < 2:
+        return 0.0
+
+    window = rows[-max(period + 1, 2) :]
+    true_ranges: list[float] = []
+    for prev_row, row in zip(window[:-1], window[1:]):
+        tr = max(
+            row.high - row.low,
+            abs(row.high - prev_row.close),
+            abs(row.low - prev_row.close),
+        )
+        true_ranges.append(tr)
+    return sum(true_ranges) / len(true_ranges) if true_ranges else 0.0
+
+
 def build_future_path(
     m15_rows: list[OHLCRow],
     current_index: int,
@@ -127,6 +147,7 @@ def build_backtest_steps_from_csv(
             swing_window=2,
             trend_threshold=0.36,
             range_threshold=0.60,
+            near_boundary_atr_ratio=0.60,
         )
     )
     m15_analyzer = StructureAnalyzer(
@@ -144,6 +165,7 @@ def build_backtest_steps_from_csv(
         TrendContinuationPolicyConfig(
             allow_long=allow_long,
             allow_short=allow_short,
+            low_tf_range_entry_guard_atr_ratio=1.20,
         )
     )
 
@@ -153,6 +175,11 @@ def build_backtest_steps_from_csv(
 
     steps: list[BacktestStep] = []
     processed = 0
+
+    # ── 诊断计数器 ──────────────────────────────────────────────
+    from collections import Counter
+    diag: Counter = Counter()
+    # ────────────────────────────────────────────────────────────
 
     for idx, current_m15 in enumerate(m15_rows):
         current_ts = current_m15.ts
@@ -169,12 +196,48 @@ def build_backtest_steps_from_csv(
             continue
 
         atr = float(current_m15.meta.get("atr", 0.0) or 0.0)
+        if atr <= 0.0:
+            atr = estimate_atr_from_rows(m15_window_rows)
+
         spread = float(current_m15.meta.get("spread", 0.0) or 0.0)
         volatility_score = float(current_m15.meta.get("volatility_score", 0.0) or 0.0)
 
         d1_state = d1_analyzer.analyze(to_generic_bars(d1_window_rows))
         h4_state = h4_analyzer.analyze(to_generic_bars(h4_window_rows))
         m15_state = m15_analyzer.analyze(to_generic_bars(m15_window_rows))
+
+        # ── 诊断：D1多头路径逐级过滤 ────────────────────────────
+        diag[f"D1 bias={d1_state.primary_bias}"] += 1
+        if d1_state.primary_bias == "long":
+            # 过滤1: reversal_candidate
+            if d1_state.phase == "reversal_candidate":
+                diag["LONG过滤@D1 phase=reversal_candidate"] += 1
+            # 过滤2: trend_score
+            elif d1_state.trend_score < policy.config.min_trend_score_high_tf:
+                diag[f"LONG过滤@D1 trend_score不足(score={d1_state.trend_score:.2f})"] += 1
+            else:
+                # D1 通过
+                # 过滤3: H4 in_value_zone
+                if not h4_state.in_value_zone:
+                    diag["LONG过滤@H4 not in_value_zone"] += 1
+                # 过滤4: H4 reversal_warning
+                elif h4_state.reversal_warning:
+                    diag["LONG过滤@H4 reversal_warning"] += 1
+                else:
+                    # H4 通过，检查 constraint_lower 距离
+                    _atr_tmp = float(current_m15.meta.get("atr", 0.0) or 0.0)
+                    _mid_price = h4_window_rows[-1].close if h4_window_rows else current_m15.close
+                    _max_dist = max(_atr_tmp * policy.config.low_tf_range_entry_guard_atr_ratio, 1e-8)
+                    if h4_state.constraint_lower is not None:
+                        _dist = max(_mid_price - h4_state.constraint_lower, 0.0)
+                        if _dist > _max_dist:
+                            diag[f"LONG过滤@H4距下缘过远(dist={_dist:.1f} max={_max_dist:.1f})"] += 1
+                            diag["LONG过滤@H4距下缘过远[汇总]"] += 1
+                        else:
+                            diag["LONG通过H4距离检查→进入M15触发器"] += 1
+                    else:
+                        diag["LONG通过H4距离检查(无constraint_lower)→进入M15触发器"] += 1
+        # ────────────────────────────────────────────────────────
 
         ctx = StrategyContext(
             ts=current_ts,
@@ -238,6 +301,20 @@ def build_backtest_steps_from_csv(
             break
 
     print(f"[信息] 多步回测数据构造完成，总步数={len(steps)}")
+
+    # ── 诊断报告写入文件 ─────────────────────────────────────────
+    import sys
+    diag_path = "backtest_diag.txt"
+    with open(diag_path, "w", encoding="utf-8") as _f:
+        _f.write("========== [诊断] 信号过滤分布 ==========\n")
+        for key, count in sorted(diag.items(), key=lambda x: -x[1]):
+            _f.write(f"  {key}: {count}\n")
+        _f.write("==========================================\n")
+    print(f"[诊断] 过滤分布已写入 {diag_path}", flush=True)
+    sys.stderr.write(f"[诊断] 过滤分布已写入 {diag_path}\n")
+    sys.stderr.flush()
+    # ────────────────────────────────────────────────────────────
+
     return steps
 
 
@@ -495,8 +572,13 @@ def main() -> None:
     if not d1_rows or not h4_rows or not m15_rows:
         raise RuntimeError("CSV 数据为空，无法回测")
 
-    allow_long = args.allow_long
-    allow_short = args.allow_short or (not args.allow_long)
+    explicit_direction_selected = args.allow_long or args.allow_short
+    allow_long = args.allow_long or (not explicit_direction_selected)
+    allow_short = args.allow_short or (not explicit_direction_selected)
+
+    print(
+        f"[信息] 方向开关：allow_long={allow_long}，allow_short={allow_short}"
+    )
 
     steps = build_backtest_steps_from_csv(
         d1_rows=d1_rows,

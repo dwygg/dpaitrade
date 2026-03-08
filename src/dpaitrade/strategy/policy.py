@@ -45,9 +45,11 @@ class TrendContinuationPolicyConfig:
     min_trend_score_low_tf: float = 0.20
 
     # 新增：低周期反转触发参数
-    low_tf_trigger_lookback: int = 8
+    low_tf_trigger_lookback: int = 18          # 观察窗口：18根M15 ≈ 4.5小时
     low_tf_breakout_buffer_atr_ratio: float = 0.03
-    low_tf_range_entry_guard_atr_ratio: float = 0.80
+    low_tf_range_entry_guard_atr_ratio: float = 1.20
+    low_tf_min_pullback_atr_ratio: float = 0.30   # 回调幅度 ≥ 0.30 ATR 才算有效回调
+    low_tf_min_post_swing_bars: int = 3            # 回调顶/底之后至少 3 根确认 K 线
 
 
 class TrendContinuationPolicy:
@@ -135,9 +137,9 @@ class TrendContinuationPolicy:
         recent = bars[-self.config.low_tf_trigger_lookback :]
         last_bar = recent[-1]
 
-        # 1) 中周期位置必须正确：靠近上缘
-        if not mid_tf.in_value_zone or not mid_tf.near_upper:
-            return False, "中周期未处于做空 value zone 上缘"
+        # 1) 中周期位置必须正确：进入做空 value zone
+        if not mid_tf.in_value_zone:
+            return False, "中周期未进入做空 value zone"
 
         # 2) 避免价格已经离上缘太远再追空
         if mid_tf.constraint_upper is not None:
@@ -201,8 +203,8 @@ class TrendContinuationPolicy:
         recent = bars[-self.config.low_tf_trigger_lookback :]
         last_bar = recent[-1]
 
-        if not mid_tf.in_value_zone or not mid_tf.near_lower:
-            return False, "中周期未处于做多 value zone 下缘"
+        if not mid_tf.in_value_zone:
+            return False, "中周期未进入做多 value zone"
 
         if mid_tf.constraint_lower is not None:
             distance_from_lower = max(ctx.mid_price - mid_tf.constraint_lower, 0.0)
@@ -266,8 +268,8 @@ class TrendContinuationPolicy:
             return None
 
         # 中周期必须提供“位置”
-        if not mid_tf.in_value_zone or not mid_tf.near_upper:
-            self.logger.info("未生成候选信号：中周期尚未进入做空 value zone 上缘")
+        if not mid_tf.in_value_zone:
+            self.logger.info("未生成候选信号：中周期尚未进入做空 value zone")
             return None
 
         if mid_tf.reversal_warning:
@@ -284,7 +286,7 @@ class TrendContinuationPolicy:
             self.logger.info("未生成候选信号：%s", trigger_reason)
             return None
 
-        stop_anchor = low_tf.last_swing_high or mid_tf.constraint_upper
+        stop_anchor = mid_tf.constraint_upper or mid_tf.last_swing_high or low_tf.last_swing_high
         if stop_anchor is None:
             self.logger.info("未生成候选信号：缺少有效止损锚点")
             return None
@@ -362,8 +364,8 @@ class TrendContinuationPolicy:
             )
             return None
 
-        if not mid_tf.in_value_zone or not mid_tf.near_lower:
-            self.logger.info("未生成候选信号：中周期尚未进入做多 value zone 下缘")
+        if not mid_tf.in_value_zone:
+            self.logger.info("未生成候选信号：中周期尚未进入做多 value zone")
             return None
 
         if mid_tf.reversal_warning:
@@ -379,7 +381,7 @@ class TrendContinuationPolicy:
             self.logger.info("未生成候选信号：%s", trigger_reason)
             return None
 
-        stop_anchor = low_tf.last_swing_low or mid_tf.constraint_lower
+        stop_anchor = mid_tf.constraint_lower or mid_tf.last_swing_low or low_tf.last_swing_low
         if stop_anchor is None:
             self.logger.info("未生成候选信号：缺少有效止损锚点")
             return None
