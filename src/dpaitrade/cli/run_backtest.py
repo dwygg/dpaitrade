@@ -8,14 +8,12 @@ from dpaitrade.agent import PassthroughAgent, SimpleRuleFilterAgent
 from dpaitrade.backtest import BacktestEngine
 from dpaitrade.core import BacktestStep, PortfolioState
 from dpaitrade.data import OHLCRow, load_ohlc_csv, slice_recent_rows
-from dpaitrade.execution import SimpleExecutionSimulator
+from dpaitrade.execution import SimpleExecutionSimulator, SimulationConfig
 from dpaitrade.risk import GuardRiskManager, RiskGuardConfig
 from dpaitrade.strategy import (
     StrategyContext,
     SwingPointPolicy,
     SwingPointPolicyConfig,
-    TrendContinuationPolicy,
-    TrendContinuationPolicyConfig,
 )
 from dpaitrade.structure import GenericBar, StructureAnalyzer, StructureAnalyzerConfig
 
@@ -263,10 +261,13 @@ def build_backtest_steps_from_csv(
             allow_short=allow_short,
             dominant_timeframe="low",
             swing_tf="mid",
-            entry_zone_atr_ratio=0.50,
+            entry_zone_atr_ratio=0.45,
             stop_buffer_atr_ratio=0.15,
-            min_rr=1.5,
+            min_rr=1.80,
             min_confirm_bar_body_atr_ratio=0.15,
+            use_higher_tf_veto=True,
+            veto_timeframe="high",
+            veto_min_trend_score=0.45,
         )
     )
 
@@ -305,33 +306,16 @@ def build_backtest_steps_from_csv(
         h4_state = h4_analyzer.analyze(to_generic_bars(h4_window_rows))
         m15_state = m15_analyzer.analyze(to_generic_bars(m15_window_rows))
 
-        dominant = {
-            "high": d1_state,
-            "mid": h4_state,
-            "low": m15_state,
-        }.get(policy.config.dominant_timeframe, m15_state)
-        diag[f"dominant_tf={policy.config.dominant_timeframe}"] += 1
-        diag[f"dominant_bias={dominant.primary_bias}"] += 1
-        diag[f"dominant_phase={dominant.phase}"] += 1
-        diag[f"h4_bias={h4_state.primary_bias}"] += 1
-        diag[f"h4_phase={h4_state.phase}"] += 1
+        swing_state = {"high": d1_state, "mid": h4_state}.get(policy.config.swing_tf, h4_state)
+        diag[f"swing_tf={policy.config.swing_tf}"] += 1
+        diag[f"swing_bias={swing_state.primary_bias}"] += 1
+        diag[f"swing_phase={swing_state.phase}"] += 1
         diag[f"d1_bias={d1_state.primary_bias}"] += 1
         diag[f"d1_phase={d1_state.phase}"] += 1
-        htf_state = {"high": d1_state, "mid": h4_state}.get(
-            policy.config.higher_tf_for_align if policy.config.require_higher_tf_bias_align else ""
-        )
-        if dominant.primary_bias == "neutral":
-            diag["过滤@主导周期 bias=neutral"] += 1
-        elif dominant.phase == "reversal_candidate":
-            diag["过滤@主导周期 phase=reversal_candidate"] += 1
-        elif policy.config.allowed_phases and dominant.phase not in policy.config.allowed_phases:
-            diag[f"过滤@allowed_phases phase={dominant.phase!r}"] += 1
-        elif dominant.trend_score < policy.config.min_trend_score_trading_tf:
-            diag[f"过滤@trend_score({dominant.trend_score:.2f}<{policy.config.min_trend_score_trading_tf})"] += 1
-        elif htf_state is not None and htf_state.primary_bias != dominant.primary_bias:
-            diag[f"过滤@高周期对齐 htf={htf_state.primary_bias!r}≠dominant={dominant.primary_bias!r}"] += 1
-        else:
-            diag["通过@全部状态过滤"] += 1
+        if swing_state.last_swing_low is not None:
+            diag["存在@摆低"] += 1
+        if swing_state.last_swing_high is not None:
+            diag["存在@摆高"] += 1
 
         dominant_pack = _dominant_components(
             policy.config.dominant_timeframe,
@@ -351,7 +335,8 @@ def build_backtest_steps_from_csv(
             future_window=future_window,
         )
 
-        h4_atr = estimate_atr_from_rows(h4_window_rows) if h4_window_rows else 0.0
+        swing_rows = {"high": d1_window_rows, "mid": h4_window_rows}.get(policy.config.swing_tf, h4_window_rows)
+        higher_tf_atr = estimate_atr_from_rows(swing_rows) if swing_rows else 0.0
 
         ctx = StrategyContext(
             ts=current_ts,
@@ -363,7 +348,7 @@ def build_backtest_steps_from_csv(
             mid_price=h4_window_rows[-1].close if h4_window_rows else current_m15.close,
             low_tf_bars=to_generic_bars(m15_window_rows),
             dominant_tf_bars=to_generic_bars(dominant_pack["window_rows"]),
-            higher_tf_atr=h4_atr,
+            higher_tf_atr=higher_tf_atr,
         )
 
         candidate_signal = policy.generate_signal(
@@ -372,6 +357,8 @@ def build_backtest_steps_from_csv(
             low_tf=m15_state,
             ctx=ctx,
         )
+        if candidate_signal is not None:
+            diag[f"候选@{candidate_signal.direction}"] += 1
 
         future_bars, future_high, future_low, future_close = build_future_path(
             m15_rows=m15_rows,
@@ -387,8 +374,10 @@ def build_backtest_steps_from_csv(
             spread=spread,
             volatility_score=volatility_score,
             extra_meta={
+                "d1_state": d1_state,
                 "h4_state": h4_state,
                 "m15_state": m15_state,
+                "swing_state": swing_state,
                 "dominant_state": dominant_pack["state"],
                 "dominant_timeframe": policy.config.dominant_timeframe,
                 "dominant_exec_bars": dominant_pack["exec_bars"],
@@ -417,13 +406,12 @@ def build_backtest_steps_from_csv(
     diag_path = "backtest_diag.txt"
     with open(diag_path, "w", encoding="utf-8") as _f:
         _f.write("========== [诊断] 信号过滤分布 ==========\n")
-        for key, count in sorted(diag.items(), key=lambda x: -x[1]):
+        for key, count in sorted(diag.items(), key=lambda x: (-x[1], x[0])):
             _f.write(f"  {key}: {count}\n")
         _f.write("==========================================\n")
     print(f"[诊断] 过滤分布已写入 {diag_path}", flush=True)
     sys.stderr.write(f"[诊断] 过滤分布已写入 {diag_path}\n")
     sys.stderr.flush()
-
     return steps
 
 
@@ -482,9 +470,9 @@ def _safe_div(a: float, b: float) -> float:
 
 
 def _infer_regime_from_open_reason(open_reason: str) -> str:
-    if "趋势延续空头候选信号" in open_reason:
-        return "trend"
-    if "趋势延续多头候选信号" in open_reason:
+    if "摆点" in open_reason:
+        return "swing_point"
+    if "趋势延续空头候选信号" in open_reason or "趋势延续多头候选信号" in open_reason:
         return "trend"
     return "unknown"
 
@@ -688,7 +676,15 @@ def main() -> None:
             reject_direction_conflict=False,
         )
     )
-    simulator = SimpleExecutionSimulator()
+    simulator = SimpleExecutionSimulator(
+        config=SimulationConfig(
+            progress_check_minutes=240,
+            min_progress_r_after_progress_check=0.15,
+            max_holding_minutes=1440,
+            min_unrealized_r_at_max_holding=0.10,
+            swing_invalidation_confirm_bars=1,
+        )
+    )
     engine = BacktestEngine(
         agent=agent,
         risk_manager=risk_manager,

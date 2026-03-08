@@ -773,3 +773,332 @@ class SwingPointPolicy:
                 "policy": "swing_point_v1",
             },
         )
+
+
+# ===========================================================================
+# SwingPointPolicy v2 —— 位置优先、单侧入场带、固定目标
+# ===========================================================================
+
+@dataclass(slots=True)
+class SwingPointPolicyConfig:
+    """高周期摆点入场策略（v2）。
+
+    设计原则：
+    - 位置优先：只在高周期摆点附近找交易，不再依赖三周期同时对齐
+    - 单侧入场带：多头只在 swing low 上方回踩带内接多；空头只在 swing high 下方反弹带内接空
+    - 确认看“拒绝 + 收回”，不是只看 K 线颜色
+    - 高周期只做 veto，不做强绑定
+    - 出场以摆点到摆点为主，执行层再补时间/PnL 退出
+    """
+
+    allow_long: bool = True
+    allow_short: bool = True
+
+    dominant_timeframe: str = "low"
+    swing_tf: str = "mid"
+
+    entry_zone_atr_ratio: float = 0.45
+    m15_to_higher_atr_factor: float = 4.0
+
+    stop_buffer_atr_ratio: float = 0.15
+    stop_buffer_spread_multiple: float = 1.5
+
+    min_rr: float = 1.80
+
+    min_confirm_bar_body_atr_ratio: float = 0.15
+    reclaim_buffer_atr_ratio: float = 0.02
+    confirm_break_buffer_atr_ratio: float = 0.02
+    recent_touch_bars: int = 2
+
+    use_higher_tf_veto: bool = True
+    veto_timeframe: str = "high"
+    veto_min_trend_score: float = 0.45
+    veto_phases: tuple[str, ...] = field(default_factory=lambda: ("impulse", "pullback"))
+
+
+class SwingPointPolicy:
+    """高周期摆点入场策略（v2）。"""
+
+    def __init__(
+        self,
+        config: Optional[SwingPointPolicyConfig] = None,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        self.config = config or SwingPointPolicyConfig()
+        self.logger = logger or self._build_logger()
+
+    @staticmethod
+    def _build_logger() -> logging.Logger:
+        logger = logging.getLogger("dpaitrade.strategy.swing_point")
+        if logger.handlers:
+            return logger
+        logger.setLevel(logging.INFO)
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter(
+            fmt="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.propagate = False
+        return logger
+
+    def _swing_state(self, high_tf: StructureState, mid_tf: StructureState) -> StructureState:
+        return {"high": high_tf, "mid": mid_tf}.get(self.config.swing_tf, mid_tf)
+
+    def _higher_atr(self, ctx: StrategyContext) -> float:
+        if ctx.higher_tf_atr > 0:
+            return ctx.higher_tf_atr
+        return max(ctx.atr * self.config.m15_to_higher_atr_factor, ctx.spread, 1e-8)
+
+    def _recent_low_bars(self, ctx: StrategyContext) -> list[GenericBar]:
+        return ctx.low_tf_bars or ctx.dominant_tf_bars or []
+
+    def _long_zone_contains(self, price: float, level: float, zone: float) -> bool:
+        return level <= price <= level + zone
+
+    def _short_zone_contains(self, price: float, level: float, zone: float) -> bool:
+        return level - zone <= price <= level
+
+    def _passes_higher_tf_veto(
+        self,
+        direction: str,
+        high_tf: StructureState,
+        mid_tf: StructureState,
+    ) -> tuple[bool, str]:
+        if not self.config.use_higher_tf_veto:
+            return True, "ok"
+        veto_state = {"high": high_tf, "mid": mid_tf}.get(self.config.veto_timeframe)
+        if veto_state is None:
+            return True, "ok"
+        opposite = "short" if direction == "long" else "long"
+        if (
+            veto_state.primary_bias == opposite
+            and veto_state.phase in self.config.veto_phases
+            and veto_state.trend_score >= self.config.veto_min_trend_score
+        ):
+            return False, (
+                f"高周期 veto：{self.config.veto_timeframe}={veto_state.primary_bias}/{veto_state.phase} "
+                f"trend_score={veto_state.trend_score:.2f}"
+            )
+        return True, "ok"
+
+    def _confirm_long(
+        self,
+        swing: StructureState,
+        ctx: StrategyContext,
+        zone: float,
+    ) -> tuple[bool, str]:
+        bars = self._recent_low_bars(ctx)
+        if len(bars) < 2:
+            return False, "M15 确认 bars 不足"
+        last = bars[-1]
+        prev = bars[-2]
+        atr = max(ctx.atr, ctx.spread, 1e-8)
+        level = float(swing.last_swing_low)
+        reclaim_buffer = max(atr * self.config.reclaim_buffer_atr_ratio, ctx.spread)
+        confirm_buffer = atr * self.config.confirm_break_buffer_atr_ratio
+
+        recent = bars[-max(int(self.config.recent_touch_bars), 1):]
+        if min(b.low for b in recent) > level + zone:
+            return False, "最近几根 M15 未真正触及摆低回踩带"
+        if last.close <= last.open:
+            return False, "最后一根不是确认阳线"
+        body = last.close - last.open
+        if body < atr * self.config.min_confirm_bar_body_atr_ratio:
+            return False, f"确认阳线实体过小 body={body:.5f}"
+        if last.close <= level + reclaim_buffer:
+            return False, "最后一根未有效收回摆低之上"
+        if last.close <= (last.high + last.low) / 2:
+            return False, "确认阳线收盘位置偏弱"
+
+        broke_prev = last.close > prev.high + confirm_buffer
+        strong_reject = last.low <= level + zone and last.close > max(prev.close, level + reclaim_buffer)
+        if not (broke_prev or strong_reject):
+            return False, "缺少足够明确的拒绝/收回确认"
+        return True, (
+            f"M15 多头确认：摆低={level:.5f}，prev_high={prev.high:.5f}，"
+            f"last_close={last.close:.5f}"
+        )
+
+    def _confirm_short(
+        self,
+        swing: StructureState,
+        ctx: StrategyContext,
+        zone: float,
+    ) -> tuple[bool, str]:
+        bars = self._recent_low_bars(ctx)
+        if len(bars) < 2:
+            return False, "M15 确认 bars 不足"
+        last = bars[-1]
+        prev = bars[-2]
+        atr = max(ctx.atr, ctx.spread, 1e-8)
+        level = float(swing.last_swing_high)
+        reclaim_buffer = max(atr * self.config.reclaim_buffer_atr_ratio, ctx.spread)
+        confirm_buffer = atr * self.config.confirm_break_buffer_atr_ratio
+
+        recent = bars[-max(int(self.config.recent_touch_bars), 1):]
+        if max(b.high for b in recent) < level - zone:
+            return False, "最近几根 M15 未真正触及摆高反弹带"
+        if last.close >= last.open:
+            return False, "最后一根不是确认阴线"
+        body = last.open - last.close
+        if body < atr * self.config.min_confirm_bar_body_atr_ratio:
+            return False, f"确认阴线实体过小 body={body:.5f}"
+        if last.close >= level - reclaim_buffer:
+            return False, "最后一根未有效收回摆高之下"
+        if last.close >= (last.high + last.low) / 2:
+            return False, "确认阴线收盘位置偏弱"
+
+        broke_prev = last.close < prev.low - confirm_buffer
+        strong_reject = last.high >= level - zone and last.close < min(prev.close, level - reclaim_buffer)
+        if not (broke_prev or strong_reject):
+            return False, "缺少足够明确的拒绝/收回确认"
+        return True, (
+            f"M15 空头确认：摆高={level:.5f}，prev_low={prev.low:.5f}，"
+            f"last_close={last.close:.5f}"
+        )
+
+    def generate_signal(
+        self,
+        high_tf: StructureState,
+        mid_tf: StructureState,
+        low_tf: StructureState,
+        ctx: StrategyContext,
+    ) -> Optional[CandidateSignal]:
+        swing = self._swing_state(high_tf, mid_tf)
+        h_atr = self._higher_atr(ctx)
+        zone = h_atr * self.config.entry_zone_atr_ratio
+
+        if (
+            self.config.allow_long
+            and swing.last_swing_low is not None
+            and not swing.structure_low_broken
+            and self._long_zone_contains(ctx.entry_price, float(swing.last_swing_low), zone)
+        ):
+            ok, reason = self._passes_higher_tf_veto("long", high_tf, mid_tf)
+            if not ok:
+                self.logger.info("摆点多头：%s", reason)
+            else:
+                ok, reason = self._confirm_long(swing, ctx, zone)
+                if ok:
+                    sig = self._build_long_signal(swing, ctx, h_atr, zone, reason)
+                    if sig is not None:
+                        return sig
+                else:
+                    self.logger.info("摆点多头：M15 确认未通过 — %s", reason)
+
+        if (
+            self.config.allow_short
+            and swing.last_swing_high is not None
+            and not swing.structure_high_broken
+            and self._short_zone_contains(ctx.entry_price, float(swing.last_swing_high), zone)
+        ):
+            ok, reason = self._passes_higher_tf_veto("short", high_tf, mid_tf)
+            if not ok:
+                self.logger.info("摆点空头：%s", reason)
+            else:
+                ok, reason = self._confirm_short(swing, ctx, zone)
+                if ok:
+                    sig = self._build_short_signal(swing, ctx, h_atr, zone, reason)
+                    if sig is not None:
+                        return sig
+                else:
+                    self.logger.info("摆点空头：M15 确认未通过 — %s", reason)
+        return None
+
+    def _build_long_signal(
+        self,
+        swing: StructureState,
+        ctx: StrategyContext,
+        h_atr: float,
+        zone: float,
+        confirm_reason: str,
+    ) -> Optional[CandidateSignal]:
+        entry = ctx.entry_price
+        stop_buf = max(h_atr * self.config.stop_buffer_atr_ratio, ctx.spread * self.config.stop_buffer_spread_multiple)
+        swing_low = float(swing.last_swing_low)
+        stop = swing_low - stop_buf
+        risk = entry - stop
+        if risk <= 0:
+            self.logger.info("摆点多头：止损计算异常 entry=%.5f sl=%.5f", entry, stop)
+            return None
+        tp: Optional[float] = swing.last_swing_high or swing.constraint_upper
+        if tp is None or tp <= entry:
+            self.logger.info("摆点多头：缺少有效对侧目标，跳过")
+            return None
+        rr = (tp - entry) / max(risk, 1e-8)
+        if rr < self.config.min_rr:
+            self.logger.info("摆点多头：R:R=%.2f < min=%.2f，跳过", rr, self.config.min_rr)
+            return None
+        return CandidateSignal(
+            ts=ctx.ts,
+            symbol=ctx.symbol,
+            direction="long",
+            entry_price=entry,
+            stop_loss=stop,
+            take_profit=tp,
+            rr_estimate=rr,
+            reason=(
+                f"摆点多头入场：{swing.timeframe}摆低={swing_low:.5f}，"
+                f"入场带=[{swing_low:.5f},{swing_low + zone:.5f}]，{confirm_reason}，"
+                f"entry={entry:.5f}，stop={stop:.5f}，tp={tp:.5f}，R:R={rr:.2f}"
+            ),
+            tags=["swing_point", "long", "liquidity_reaction"],
+            meta={
+                "policy": "swing_point_v2",
+                "swing_tf": swing.timeframe,
+                "dominant_tf": self.config.dominant_timeframe,
+                "swing_low": swing_low,
+                "swing_high": tp,
+                "zone_upper": swing_low + zone,
+            },
+        )
+
+    def _build_short_signal(
+        self,
+        swing: StructureState,
+        ctx: StrategyContext,
+        h_atr: float,
+        zone: float,
+        confirm_reason: str,
+    ) -> Optional[CandidateSignal]:
+        entry = ctx.entry_price
+        stop_buf = max(h_atr * self.config.stop_buffer_atr_ratio, ctx.spread * self.config.stop_buffer_spread_multiple)
+        swing_high = float(swing.last_swing_high)
+        stop = swing_high + stop_buf
+        risk = stop - entry
+        if risk <= 0:
+            self.logger.info("摆点空头：止损计算异常 entry=%.5f sl=%.5f", entry, stop)
+            return None
+        tp: Optional[float] = swing.last_swing_low or swing.constraint_lower
+        if tp is None or tp >= entry:
+            self.logger.info("摆点空头：缺少有效对侧目标，跳过")
+            return None
+        rr = (entry - tp) / max(risk, 1e-8)
+        if rr < self.config.min_rr:
+            self.logger.info("摆点空头：R:R=%.2f < min=%.2f，跳过", rr, self.config.min_rr)
+            return None
+        return CandidateSignal(
+            ts=ctx.ts,
+            symbol=ctx.symbol,
+            direction="short",
+            entry_price=entry,
+            stop_loss=stop,
+            take_profit=tp,
+            rr_estimate=rr,
+            reason=(
+                f"摆点空头入场：{swing.timeframe}摆高={swing_high:.5f}，"
+                f"入场带=[{swing_high - zone:.5f},{swing_high:.5f}]，{confirm_reason}，"
+                f"entry={entry:.5f}，stop={stop:.5f}，tp={tp:.5f}，R:R={rr:.2f}"
+            ),
+            tags=["swing_point", "short", "liquidity_reaction"],
+            meta={
+                "policy": "swing_point_v2",
+                "swing_tf": swing.timeframe,
+                "dominant_tf": self.config.dominant_timeframe,
+                "swing_high": swing_high,
+                "swing_low": tp,
+                "zone_lower": swing_high - zone,
+            },
+        )
