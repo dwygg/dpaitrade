@@ -38,15 +38,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--future-window",
         type=int,
-        default=64,
-        help="执行模拟时，用后续多少根 M15 生成 future_high/future_low/future_close",
+        default=96,
+        help="执行模拟时，用后续多少根 M15 生成 future_high/future_low/future_close（96根=24h）",
     )
 
     parser.add_argument("--d1-lookback", type=int, default=24, help="D1 回看窗口")
     parser.add_argument("--h4-lookback", type=int, default=24, help="H4 回看窗口")
     parser.add_argument("--m15-lookback", type=int, default=24, help="M15 回看窗口")
 
-    parser.add_argument("--cooldown-steps", type=int, default=4, help="成交后冷却步数")
+    parser.add_argument("--cooldown-steps", type=int, default=2, help="成交后冷却步数（默认 2 步=30min）")
 
     parser.add_argument("--allow-long", action="store_true", help="允许做多")
     parser.add_argument("--allow-short", action="store_true", help="允许做空")
@@ -261,19 +261,25 @@ def build_backtest_steps_from_csv(
             allow_short=allow_short,
             dominant_timeframe="low",
             swing_tf="mid",
-            entry_zone_atr_ratio=0.45,
-            stop_buffer_atr_ratio=0.15,
-            min_rr=1.80,
-            max_rr=4.00,
-            min_confirm_bar_body_atr_ratio=0.15,
+            entry_zone_atr_ratio=0.30,          # 收紧入场区，靠近摆点入场
+            stop_buffer_atr_ratio=0.20,
+            min_rr=2.0,
+            max_rr=6.0,
+            min_confirm_bar_body_atr_ratio=0.20, # 要求更强的确认 K 线实体
+            reclaim_buffer_atr_ratio=0.10,       # 确认 bar 须收在摆点上方 10% M15 ATR，过滤贴线入场
+            confirm_break_buffer_atr_ratio=0.05, # strong_reject 确认需突破幅度，避免 2pts 误判
             recent_touch_bars=3,
             use_higher_tf_veto=True,
             veto_timeframe="high",
             veto_min_trend_score=0.45,
-            veto_phases=("impulse",),
-            max_attempts_per_swing=2,
+            veto_phases=("impulse", "pullback"),
+            max_attempts_per_swing=1,            # 同一摆点只入场一次，避免双亏
             max_cumulative_loss_r_per_swing=1.50,
             require_reset_after_loss=True,
+            require_d1_bias_align=True,          # 只顺 D1 方向交易，避免逆势入场
+            require_h4_bias_align=False,         # H4 摆点入场本身就是等待 H4 结构转折
+            require_actual_sweep=True,           # sweep 路径：价格实际刺穿摆点（流动性扫清）
+            min_zone_test_bars=2,                # zone-test 路径：至少 2 根 M15 测试区间（测不破即入）
         )
     )
 
@@ -287,11 +293,16 @@ def build_backtest_steps_from_csv(
     from collections import Counter
     diag: Counter = Counter()
 
+    from datetime import timedelta
+
     for idx, current_m15 in enumerate(m15_rows):
         current_ts = current_m15.ts
 
-        d1_window_rows = slice_recent_rows(d1_rows, d1_ts, current_ts, d1_lookback)
-        h4_window_rows = slice_recent_rows(h4_rows, h4_ts, current_ts, h4_lookback)
+        # 时间对齐：MT5 bar 的 timestamp 是开盘时间，需减去周期长度才能确保只用已收盘的 bar
+        # H4 bar 在开盘后 4h 才收盘，D1 bar 在开盘后 1 天才收盘
+        # 若不减去偏移，会包含当前正在形成中的 bar，造成前视偏差
+        d1_window_rows = slice_recent_rows(d1_rows, d1_ts, current_ts - timedelta(days=1), d1_lookback)
+        h4_window_rows = slice_recent_rows(h4_rows, h4_ts, current_ts - timedelta(hours=4), h4_lookback)
         m15_window_rows = slice_recent_rows(m15_rows, m15_ts, current_ts, m15_lookback)
 
         if len(d1_window_rows) < d1_lookback:
@@ -689,7 +700,7 @@ def main() -> None:
             min_progress_r_after_progress_check=0.15,
             max_holding_minutes=1440,
             min_unrealized_r_at_max_holding=0.10,
-            swing_invalidation_confirm_bars=1,
+            swing_invalidation_confirm_bars=3,  # 优化：2 → 3，进一步减少快速假突破触发离场
         )
     )
     engine = BacktestEngine(

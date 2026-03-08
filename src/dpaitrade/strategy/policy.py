@@ -645,6 +645,7 @@ class SwingPointPolicy:
         swing: StructureState,
         ctx: StrategyContext,
         zone: float,
+        h_atr: float,
     ) -> tuple[bool, str]:
         bars = self._recent_low_bars(ctx)
         if len(bars) < 2:
@@ -655,12 +656,17 @@ class SwingPointPolicy:
         level = float(swing.last_swing_high)
         reclaim_buffer = max(atr * self.config.reclaim_buffer_atr_ratio, ctx.spread)
         confirm_buffer = atr * self.config.confirm_break_buffer_atr_ratio
-        touch_band = max(atr * self.config.sweep_touch_atr_ratio, ctx.spread)
+        # 使用 H4 ATR 计算 touch_band，避免 M15 ATR 过小导致扫高条件过严
+        touch_band = max(h_atr * self.config.sweep_touch_atr_ratio, ctx.spread)
 
         recent = bars[-max(int(self.config.recent_touch_bars), 1):]
         recent_max_high = max(b.high for b in recent)
-        if recent_max_high < level - touch_band:
-            return False, "最近几根 M15 未真正扫到摆高附近"
+        if self.config.require_actual_sweep:
+            if recent_max_high <= level:
+                return False, "最近几根 M15 未实际刺穿摆高（require_actual_sweep=True）"
+        else:
+            if recent_max_high < level - touch_band:
+                return False, "最近几根 M15 未真正扫到摆高附近"
         if last.close >= last.open:
             return False, "最后一根不是确认阴线"
         body = last.open - last.close
@@ -671,17 +677,22 @@ class SwingPointPolicy:
         if last.close >= (last.high + last.low) / 2:
             return False, "确认阴线收盘位置偏弱"
 
-        swept = recent_max_high >= level - touch_band
         reclaimed = last.close < level - reclaim_buffer
         broke_prev = last.close < prev.low - confirm_buffer
-        strong_reject = (
-            last.high >= level - touch_band
-            and last.close < min(prev.close, level - reclaim_buffer)
-        ) or (
-            recent_max_high > level and last.close < prev.close - confirm_buffer
-        )
-        if not swept:
-            return False, "最近几根没有充分反弹到摆高"
+        if self.config.require_actual_sweep:
+            strong_reject = (
+                last.high > level  # 单根 bar 直接刺穿摆高
+                and last.close < min(prev.close, level - reclaim_buffer)
+            ) or (
+                recent_max_high > level and last.close < prev.close - confirm_buffer
+            )
+        else:
+            strong_reject = (
+                last.high >= level - touch_band
+                and last.close < min(prev.close, level - reclaim_buffer)
+            ) or (
+                recent_max_high > level and last.close < prev.close - confirm_buffer
+            )
         if not reclaimed:
             return False, "最近确认 bar 未完成有效收回"
         if not (broke_prev or strong_reject):
@@ -889,6 +900,9 @@ class SwingPointPolicyConfig:
     confirm_break_buffer_atr_ratio: float = 0.02
     sweep_touch_atr_ratio: float = 0.08
     recent_touch_bars: int = 3
+    # True：要求价格真正刺穿摆点（< swing_low / > swing_high），而不只是接近
+    # 这是"流动性扫清"模式的核心条件；False 为宽松模式（向前兼容）
+    require_actual_sweep: bool = False
 
     max_attempts_per_swing: int = 2
     max_cumulative_loss_r_per_swing: float = 1.50
@@ -897,7 +911,19 @@ class SwingPointPolicyConfig:
     use_higher_tf_veto: bool = True
     veto_timeframe: str = "high"
     veto_min_trend_score: float = 0.45
+    # impulse + pullback 均 veto：覆盖高周期强趋势反向入场场景
     veto_phases: tuple[str, ...] = field(default_factory=lambda: ("impulse", "pullback"))
+
+    # D1 方向对齐：True 时只允许与 D1 主偏向一致的信号通过
+    # "neutral" 视为不阻止任何方向
+    require_d1_bias_align: bool = False
+
+    # H4 方向对齐：True 时要求 H4 主偏向也与信号方向一致（过滤弱势摆点）
+    require_h4_bias_align: bool = False
+
+    # 区间测试信号路径：最近 m15_lookback 根 K 线中，至少有 N 根进入入场区（无需实际刺穿）
+    # 0 = 禁用该路径；与 require_actual_sweep 路径互为补充，可同时启用
+    min_zone_test_bars: int = 0
 
 
 class SwingPointPolicy:
@@ -916,7 +942,7 @@ class SwingPointPolicy:
         logger = logging.getLogger("dpaitrade.strategy.swing_point")
         if logger.handlers:
             return logger
-        logger.setLevel(logging.INFO)
+        logger.setLevel(logging.WARNING)
         handler = logging.StreamHandler()
         formatter = logging.Formatter(
             fmt="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
@@ -937,6 +963,71 @@ class SwingPointPolicy:
 
     def _recent_low_bars(self, ctx: StrategyContext) -> list[GenericBar]:
         return ctx.low_tf_bars or ctx.dominant_tf_bars or []
+
+    def _count_zone_entries_long(self, ctx: StrategyContext, level: float, zone: float) -> int:
+        """统计最近多少根 M15 bar 的最低价进入了多头入场区 [level, level+zone]。"""
+        return sum(1 for b in self._recent_low_bars(ctx) if level <= b.low <= level + zone)
+
+    def _count_zone_entries_short(self, ctx: StrategyContext, level: float, zone: float) -> int:
+        """统计最近多少根 M15 bar 的最高价进入了空头入场区 [level-zone, level]。"""
+        return sum(1 for b in self._recent_low_bars(ctx) if level - zone <= b.high <= level)
+
+    def _confirm_zone_hold_long(
+        self,
+        swing: StructureState,
+        ctx: StrategyContext,
+        h_atr: float,
+    ) -> tuple[bool, str]:
+        """区间测试路径的多头确认：摆低被多次测试均未收盘跌破，当前 bar 给出阳线确认。"""
+        bars = self._recent_low_bars(ctx)
+        if len(bars) < 2:
+            return False, "M15 bars 不足"
+        last = bars[-1]
+        atr = max(ctx.atr, ctx.spread, 1e-8)
+        level = float(swing.last_swing_low)
+        reclaim_buffer = max(atr * self.config.reclaim_buffer_atr_ratio, ctx.spread)
+        # 检查最近 K 线没有收盘跌破摆低（支撑守住）
+        test_bars = bars[-max(self.config.min_zone_test_bars, 2):]
+        if any(b.close < level for b in test_bars):
+            return False, "区间测试期间有 K 线收盘跌破摆低，支撑失效"
+        if last.close <= last.open:
+            return False, "最后一根不是确认阳线"
+        body = last.close - last.open
+        if body < atr * self.config.min_confirm_bar_body_atr_ratio:
+            return False, f"确认阳线实体过小 body={body:.5f}"
+        if last.close <= level + reclaim_buffer:
+            return False, "最后一根未有效站稳摆低之上"
+        if last.close <= (last.high + last.low) / 2:
+            return False, "确认阳线收盘位置偏弱"
+        return True, f"M15 区间多测确认：摆低={level:.5f}，last_close={last.close:.5f}"
+
+    def _confirm_zone_hold_short(
+        self,
+        swing: StructureState,
+        ctx: StrategyContext,
+        h_atr: float,
+    ) -> tuple[bool, str]:
+        """区间测试路径的空头确认：摆高被多次测试均未收盘突破，当前 bar 给出阴线确认。"""
+        bars = self._recent_low_bars(ctx)
+        if len(bars) < 2:
+            return False, "M15 bars 不足"
+        last = bars[-1]
+        atr = max(ctx.atr, ctx.spread, 1e-8)
+        level = float(swing.last_swing_high)
+        reclaim_buffer = max(atr * self.config.reclaim_buffer_atr_ratio, ctx.spread)
+        test_bars = bars[-max(self.config.min_zone_test_bars, 2):]
+        if any(b.close > level for b in test_bars):
+            return False, "区间测试期间有 K 线收盘突破摆高，阻力失效"
+        if last.close >= last.open:
+            return False, "最后一根不是确认阴线"
+        body = last.open - last.close
+        if body < atr * self.config.min_confirm_bar_body_atr_ratio:
+            return False, f"确认阴线实体过小 body={body:.5f}"
+        if last.close >= level - reclaim_buffer:
+            return False, "最后一根未有效压回摆高之下"
+        if last.close >= (last.high + last.low) / 2:
+            return False, "确认阴线收盘位置偏弱"
+        return True, f"M15 区间多测确认：摆高={level:.5f}，last_close={last.close:.5f}"
 
     def _long_zone_contains(self, price: float, level: float, zone: float) -> bool:
         return level <= price <= level + zone
@@ -972,6 +1063,7 @@ class SwingPointPolicy:
         swing: StructureState,
         ctx: StrategyContext,
         zone: float,
+        h_atr: float,
     ) -> tuple[bool, str]:
         bars = self._recent_low_bars(ctx)
         if len(bars) < 2:
@@ -982,12 +1074,17 @@ class SwingPointPolicy:
         level = float(swing.last_swing_low)
         reclaim_buffer = max(atr * self.config.reclaim_buffer_atr_ratio, ctx.spread)
         confirm_buffer = atr * self.config.confirm_break_buffer_atr_ratio
-        touch_band = max(atr * self.config.sweep_touch_atr_ratio, ctx.spread)
+        # 使用 H4 ATR 计算 touch_band，避免 M15 ATR 过小导致扫低条件过严
+        touch_band = max(h_atr * self.config.sweep_touch_atr_ratio, ctx.spread)
 
         recent = bars[-max(int(self.config.recent_touch_bars), 1):]
         recent_min_low = min(b.low for b in recent)
-        if recent_min_low > level + touch_band:
-            return False, "最近几根 M15 未真正扫到摆低附近"
+        if self.config.require_actual_sweep:
+            if recent_min_low >= level:
+                return False, "最近几根 M15 未实际刺穿摆低（require_actual_sweep=True）"
+        else:
+            if recent_min_low > level + touch_band:
+                return False, "最近几根 M15 未真正扫到摆低附近"
         if last.close <= last.open:
             return False, "最后一根不是确认阳线"
         body = last.close - last.open
@@ -998,17 +1095,22 @@ class SwingPointPolicy:
         if last.close <= (last.high + last.low) / 2:
             return False, "确认阳线收盘位置偏弱"
 
-        swept = recent_min_low <= level + touch_band
         reclaimed = last.close > level + reclaim_buffer
         broke_prev = last.close > prev.high + confirm_buffer
-        strong_reject = (
-            last.low <= level + touch_band
-            and last.close > max(prev.close, level + reclaim_buffer)
-        ) or (
-            recent_min_low < level and last.close > prev.close + confirm_buffer
-        )
-        if not swept:
-            return False, "最近几根没有充分回踩到摆低"
+        if self.config.require_actual_sweep:
+            strong_reject = (
+                last.low < level  # 单根 bar 直接刺穿摆低
+                and last.close > max(prev.close, level + reclaim_buffer)
+            ) or (
+                recent_min_low < level and last.close > prev.close + confirm_buffer
+            )
+        else:
+            strong_reject = (
+                last.low <= level + touch_band
+                and last.close > max(prev.close, level + reclaim_buffer)
+            ) or (
+                recent_min_low < level and last.close > prev.close + confirm_buffer
+            )
         if not reclaimed:
             return False, "最近确认 bar 未完成有效收回"
         if not (broke_prev or strong_reject):
@@ -1023,6 +1125,7 @@ class SwingPointPolicy:
         swing: StructureState,
         ctx: StrategyContext,
         zone: float,
+        h_atr: float,
     ) -> tuple[bool, str]:
         bars = self._recent_low_bars(ctx)
         if len(bars) < 2:
@@ -1033,12 +1136,17 @@ class SwingPointPolicy:
         level = float(swing.last_swing_high)
         reclaim_buffer = max(atr * self.config.reclaim_buffer_atr_ratio, ctx.spread)
         confirm_buffer = atr * self.config.confirm_break_buffer_atr_ratio
-        touch_band = max(atr * self.config.sweep_touch_atr_ratio, ctx.spread)
+        # 使用 H4 ATR 计算 touch_band，避免 M15 ATR 过小导致扫高条件过严
+        touch_band = max(h_atr * self.config.sweep_touch_atr_ratio, ctx.spread)
 
         recent = bars[-max(int(self.config.recent_touch_bars), 1):]
         recent_max_high = max(b.high for b in recent)
-        if recent_max_high < level - touch_band:
-            return False, "最近几根 M15 未真正扫到摆高附近"
+        if self.config.require_actual_sweep:
+            if recent_max_high <= level:
+                return False, "最近几根 M15 未实际刺穿摆高（require_actual_sweep=True）"
+        else:
+            if recent_max_high < level - touch_band:
+                return False, "最近几根 M15 未真正扫到摆高附近"
         if last.close >= last.open:
             return False, "最后一根不是确认阴线"
         body = last.open - last.close
@@ -1049,17 +1157,22 @@ class SwingPointPolicy:
         if last.close >= (last.high + last.low) / 2:
             return False, "确认阴线收盘位置偏弱"
 
-        swept = recent_max_high >= level - touch_band
         reclaimed = last.close < level - reclaim_buffer
         broke_prev = last.close < prev.low - confirm_buffer
-        strong_reject = (
-            last.high >= level - touch_band
-            and last.close < min(prev.close, level - reclaim_buffer)
-        ) or (
-            recent_max_high > level and last.close < prev.close - confirm_buffer
-        )
-        if not swept:
-            return False, "最近几根没有充分反弹到摆高"
+        if self.config.require_actual_sweep:
+            strong_reject = (
+                last.high > level  # 单根 bar 直接刺穿摆高
+                and last.close < min(prev.close, level - reclaim_buffer)
+            ) or (
+                recent_max_high > level and last.close < prev.close - confirm_buffer
+            )
+        else:
+            strong_reject = (
+                last.high >= level - touch_band
+                and last.close < min(prev.close, level - reclaim_buffer)
+            ) or (
+                recent_max_high > level and last.close < prev.close - confirm_buffer
+            )
         if not reclaimed:
             return False, "最近确认 bar 未完成有效收回"
         if not (broke_prev or strong_reject):
@@ -1080,41 +1193,88 @@ class SwingPointPolicy:
         h_atr = self._higher_atr(ctx)
         zone = h_atr * self.config.entry_zone_atr_ratio
 
+        d1_bias = high_tf.primary_bias  # "long" / "short" / "neutral"
+        h4_bias = mid_tf.primary_bias
+
+        # ---------- 多头方向 ----------
         if (
             self.config.allow_long
             and swing.last_swing_low is not None
             and not swing.structure_low_broken
             and self._long_zone_contains(ctx.entry_price, float(swing.last_swing_low), zone)
         ):
-            ok, reason = self._passes_higher_tf_veto("long", high_tf, mid_tf)
-            if not ok:
-                self.logger.info("摆点多头：%s", reason)
+            _d1_ok = not self.config.require_d1_bias_align or d1_bias in ("long", "neutral")
+            _h4_ok = not self.config.require_h4_bias_align or h4_bias in ("long", "neutral")
+            if not _d1_ok:
+                self.logger.debug("摆点多头：D1偏向=%s，方向不一致，跳过", d1_bias)
+            elif not _h4_ok:
+                self.logger.debug("摆点多头：H4偏向=%s，方向不一致，跳过", h4_bias)
             else:
-                ok, reason = self._confirm_long(swing, ctx, zone)
-                if ok:
-                    sig = self._build_long_signal(swing, ctx, h_atr, zone, reason)
-                    if sig is not None:
-                        return sig
+                ok, reason = self._passes_higher_tf_veto("long", high_tf, mid_tf)
+                if not ok:
+                    self.logger.debug("摆点多头 veto：%s", reason)
                 else:
-                    self.logger.info("摆点多头：M15 确认未通过 — %s", reason)
+                    # 路径1：实际刺穿扫清（require_actual_sweep）
+                    ok, reason = self._confirm_long(swing, ctx, zone, h_atr)
+                    if ok:
+                        sig = self._build_long_signal(swing, ctx, h_atr, zone, reason)
+                        if sig is not None:
+                            return sig
+                    else:
+                        self.logger.debug("摆点多头 sweep 路径未通过：%s", reason)
+                    # 路径2：区间多次测试（min_zone_test_bars > 0）
+                    if self.config.min_zone_test_bars > 0:
+                        n_tests = self._count_zone_entries_long(
+                            ctx, float(swing.last_swing_low), zone
+                        )
+                        if n_tests >= self.config.min_zone_test_bars:
+                            ok2, reason2 = self._confirm_zone_hold_long(swing, ctx, h_atr)
+                            if ok2:
+                                sig = self._build_long_signal(swing, ctx, h_atr, zone, reason2)
+                                if sig is not None:
+                                    return sig
+                            else:
+                                self.logger.debug("摆点多头 zone-test 路径未通过：%s", reason2)
 
+        # ---------- 空头方向 ----------
         if (
             self.config.allow_short
             and swing.last_swing_high is not None
             and not swing.structure_high_broken
             and self._short_zone_contains(ctx.entry_price, float(swing.last_swing_high), zone)
         ):
-            ok, reason = self._passes_higher_tf_veto("short", high_tf, mid_tf)
-            if not ok:
-                self.logger.info("摆点空头：%s", reason)
+            _d1_ok = not self.config.require_d1_bias_align or d1_bias in ("short", "neutral")
+            _h4_ok = not self.config.require_h4_bias_align or h4_bias in ("short", "neutral")
+            if not _d1_ok:
+                self.logger.debug("摆点空头：D1偏向=%s，方向不一致，跳过", d1_bias)
+            elif not _h4_ok:
+                self.logger.debug("摆点空头：H4偏向=%s，方向不一致，跳过", h4_bias)
             else:
-                ok, reason = self._confirm_short(swing, ctx, zone)
-                if ok:
-                    sig = self._build_short_signal(swing, ctx, h_atr, zone, reason)
-                    if sig is not None:
-                        return sig
+                ok, reason = self._passes_higher_tf_veto("short", high_tf, mid_tf)
+                if not ok:
+                    self.logger.debug("摆点空头 veto：%s", reason)
                 else:
-                    self.logger.info("摆点空头：M15 确认未通过 — %s", reason)
+                    # 路径1：实际刺穿扫清
+                    ok, reason = self._confirm_short(swing, ctx, zone, h_atr)
+                    if ok:
+                        sig = self._build_short_signal(swing, ctx, h_atr, zone, reason)
+                        if sig is not None:
+                            return sig
+                    else:
+                        self.logger.debug("摆点空头 sweep 路径未通过：%s", reason)
+                    # 路径2：区间多次测试
+                    if self.config.min_zone_test_bars > 0:
+                        n_tests = self._count_zone_entries_short(
+                            ctx, float(swing.last_swing_high), zone
+                        )
+                        if n_tests >= self.config.min_zone_test_bars:
+                            ok2, reason2 = self._confirm_zone_hold_short(swing, ctx, h_atr)
+                            if ok2:
+                                sig = self._build_short_signal(swing, ctx, h_atr, zone, reason2)
+                                if sig is not None:
+                                    return sig
+                            else:
+                                self.logger.debug("摆点空头 zone-test 路径未通过：%s", reason2)
         return None
 
     def _build_long_signal(
@@ -1131,15 +1291,15 @@ class SwingPointPolicy:
         stop = swing_low - stop_buf
         risk = entry - stop
         if risk <= 0:
-            self.logger.info("摆点多头：止损计算异常 entry=%.5f sl=%.5f", entry, stop)
+            self.logger.warning("摆点多头：止损计算异常 entry=%.5f sl=%.5f", entry, stop)
             return None
         tp: Optional[float] = swing.last_swing_high or swing.constraint_upper
         if tp is None or tp <= entry:
-            self.logger.info("摆点多头：缺少有效对侧目标，跳过")
+            self.logger.debug("摆点多头：缺少有效对侧目标，跳过")
             return None
         rr = (tp - entry) / max(risk, 1e-8)
         if rr < self.config.min_rr:
-            self.logger.info("摆点多头：R:R=%.2f < min=%.2f，跳过", rr, self.config.min_rr)
+            self.logger.debug("摆点多头：R:R=%.2f < min=%.2f，跳过", rr, self.config.min_rr)
             return None
         if self.config.max_rr > 0 and rr > self.config.max_rr:
             tp = entry + risk * self.config.max_rr
@@ -1187,15 +1347,15 @@ class SwingPointPolicy:
         stop = swing_high + stop_buf
         risk = stop - entry
         if risk <= 0:
-            self.logger.info("摆点空头：止损计算异常 entry=%.5f sl=%.5f", entry, stop)
+            self.logger.warning("摆点空头：止损计算异常 entry=%.5f sl=%.5f", entry, stop)
             return None
         tp: Optional[float] = swing.last_swing_low or swing.constraint_lower
         if tp is None or tp >= entry:
-            self.logger.info("摆点空头：缺少有效对侧目标，跳过")
+            self.logger.debug("摆点空头：缺少有效对侧目标，跳过")
             return None
         rr = (entry - tp) / max(risk, 1e-8)
         if rr < self.config.min_rr:
-            self.logger.info("摆点空头：R:R=%.2f < min=%.2f，跳过", rr, self.config.min_rr)
+            self.logger.debug("摆点空头：R:R=%.2f < min=%.2f，跳过", rr, self.config.min_rr)
             return None
         if self.config.max_rr > 0 and rr > self.config.max_rr:
             tp = entry - risk * self.config.max_rr

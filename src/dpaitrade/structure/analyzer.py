@@ -77,7 +77,7 @@ class StructureAnalyzer:
         if logger.handlers:
             return logger
 
-        logger.setLevel(logging.INFO)
+        logger.setLevel(logging.WARNING)
         handler = logging.StreamHandler()
         formatter = logging.Formatter(
             fmt="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
@@ -98,7 +98,7 @@ class StructureAnalyzer:
                 f"{self.config.timeframe} 数据不足："
                 f"当前 {len(bars)} 根，小于所需 {required} 根"
             )
-            self.logger.info(reason)
+            self.logger.debug(reason)
             return self._unknown_state(ts=bars[-1].ts if bars else datetime.min, reason=reason)
 
         window = bars[-self.config.lookback :]
@@ -187,7 +187,7 @@ class StructureAnalyzer:
             structure_high_broken=structure_high_broken,
             structure_low_broken=structure_low_broken,
         )
-        self.logger.info(reason)
+        self.logger.debug(reason)
 
         return StructureState(
             timeframe=self.config.timeframe,

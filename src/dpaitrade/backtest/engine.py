@@ -198,7 +198,7 @@ class BacktestEngine:
         if logger.handlers:
             return logger
 
-        logger.setLevel(logging.INFO)
+        logger.setLevel(logging.INFO)  # DEBUG 级别由此过滤，仅输出关键事件
 
         handler = logging.StreamHandler()
         formatter = logging.Formatter(
@@ -252,7 +252,7 @@ class BacktestEngine:
             signal = step.candidate_signal
             step_portfolio_state = step.portfolio_state or portfolio_state
 
-            self.logger.info(
+            self.logger.debug(
                 "处理回测步[%s]，时间=%s，品种=%s，D1状态=%s，D1偏置=%s",
                 idx,
                 market_state.ts,
@@ -264,31 +264,25 @@ class BacktestEngine:
             self._update_swing_trackers(portfolio_state=portfolio_state, market_state=market_state)
 
             if busy_until is not None and market_state.ts < busy_until:
-                self.logger.info(
-                    "当前已有持仓覆盖此时刻，持仓结束时间=%s，跳过本步",
-                    busy_until,
-                )
+                self.logger.debug("持仓中，跳过（busy_until=%s）", busy_until)
                 continue
 
             if cooldown_remaining > 0:
-                self.logger.info(
-                    "当前处于冷却期，剩余步数=%s，跳过本步信号判断",
-                    cooldown_remaining,
-                )
+                self.logger.debug("冷却期剩余=%s，跳过", cooldown_remaining)
                 cooldown_remaining -= 1
                 continue
             if signal is None:
-                self.logger.info("当前回测步无候选信号，跳过")
+                self.logger.debug("无候选信号，跳过")
                 continue
 
             result.total_candidate_signals += 1
             self.logger.info(
-                "发现候选信号：方向=%s，入场价=%.5f，止损=%.5f，预估RR=%.3f，原因=%s",
+                "候选信号 [%s %s] entry=%.2f sl=%.2f RR=%.2f",
                 signal.direction,
+                signal.symbol,
                 signal.entry_price,
                 signal.stop_loss,
                 signal.rr_estimate,
-                signal.reason,
             )
 
             swing_reject_reason = self._swing_reuse_reject_reason(
@@ -297,7 +291,7 @@ class BacktestEngine:
             )
             if swing_reject_reason:
                 result.total_risk_rejected += 1
-                self.logger.info(swing_reject_reason)
+                self.logger.info("摆点复用拒绝：%s", swing_reject_reason)
                 continue
 
             # --------------------------
@@ -309,19 +303,16 @@ class BacktestEngine:
                 portfolio_state=step_portfolio_state,
             )
 
-            self.logger.info(
-                "Agent 决策：allow_trade=%s，direction_bias=%s，setup_score=%.4f，"
-                "risk_adjustment=%.2f，原因=%s",
+            self.logger.debug(
+                "Agent 决策：allow_trade=%s，setup_score=%.4f，原因=%s",
                 agent_decision.allow_trade,
-                agent_decision.direction_bias,
                 agent_decision.setup_score,
-                agent_decision.risk_adjustment,
                 agent_decision.reason,
             )
 
             if not agent_decision.allow_trade:
                 result.total_agent_rejected += 1
-                self.logger.info("候选信号被 Agent 拒绝，进入下一步")
+                self.logger.info("Agent 拒绝 [%s %s]：%s", signal.direction, signal.symbol, agent_decision.reason)
                 continue
 
             # --------------------------
@@ -334,16 +325,9 @@ class BacktestEngine:
                 portfolio_state=step_portfolio_state,
             )
 
-            self.logger.info(
-                "风控审批结果：approved=%s，risk_pct=%.4f，原因=%s",
-                risk_decision.approved,
-                risk_decision.risk_pct,
-                risk_decision.reject_reason or "通过",
-            )
-
             if not risk_decision.approved:
                 result.total_risk_rejected += 1
-                self.logger.info("候选信号被风控拒绝，进入下一步")
+                self.logger.info("风控拒绝 [%s %s]：%s", signal.direction, signal.symbol, risk_decision.reject_reason)
                 continue
 
             # --------------------------
@@ -378,8 +362,12 @@ class BacktestEngine:
                 self.logger.info("成交后进入冷却期，冷却步数=%s", self.cooldown_steps)
                 
             self.logger.info(
-                "成交记录已写入：方向=%s，净盈亏=%.2f，R值=%.2f，当前权益=%.2f",
+                "成交 [%s %s] entry=%.2f exit=%.2f 原因=%s pnl=%.2f (%.2fR) 权益=%.2f",
                 trade_record.direction,
+                trade_record.symbol,
+                trade_record.entry_price,
+                trade_record.exit_price,
+                trade_record.close_reason,
                 trade_record.pnl,
                 trade_record.pnl_r,
                 portfolio_state.equity,

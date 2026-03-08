@@ -65,7 +65,7 @@ class GuardRiskManager:
         if logger.handlers:
             return logger
 
-        logger.setLevel(logging.INFO)
+        logger.setLevel(logging.WARNING)
         handler = logging.StreamHandler()
         formatter = logging.Formatter(
             fmt="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
@@ -90,8 +90,8 @@ class GuardRiskManager:
         - RiskDecision.approve(): 风控通过
         - RiskDecision.reject(): 风控拒绝
         """
-        self.logger.info(
-            "开始风控审核：symbol=%s，direction=%s，setup_score=%.4f，spread=%.4f，used_risk_pct=%.4f",
+        self.logger.debug(
+            "风控审核：symbol=%s，direction=%s，setup_score=%.4f，spread=%.4f，used_risk_pct=%.4f",
             signal.symbol,
             signal.direction,
             agent_decision.setup_score,
@@ -101,12 +101,12 @@ class GuardRiskManager:
 
         if not agent_decision.allow_trade:
             reason = "风控拒绝：Agent 已明确拒绝该交易，不进入风险审批"
-            self.logger.info(reason)
+            self.logger.debug(reason)
             return RiskDecision.reject(reject_reason=reason)
 
         if signal.direction == "neutral":
             reason = "风控拒绝：候选信号方向为 neutral"
-            self.logger.info(reason)
+            self.logger.debug(reason)
             return RiskDecision.reject(reject_reason=reason)
 
         if market_state.spread > self.config.max_spread:
@@ -114,7 +114,7 @@ class GuardRiskManager:
                 f"风控拒绝：当前点差过大（spread={market_state.spread:.4f} > "
                 f"{self.config.max_spread:.4f}）"
             )
-            self.logger.info(reason)
+            self.logger.debug(reason)
             return RiskDecision.reject(reject_reason=reason, meta={"spread": market_state.spread})
 
         if portfolio_state.consecutive_losses >= self.config.max_consecutive_losses:
@@ -122,7 +122,7 @@ class GuardRiskManager:
                 f"风控拒绝：连续亏损次数过多（{portfolio_state.consecutive_losses} >= "
                 f"{self.config.max_consecutive_losses}）"
             )
-            self.logger.info(reason)
+            self.logger.warning(reason)
             return RiskDecision.reject(
                 reject_reason=reason,
                 meta={"consecutive_losses": portfolio_state.consecutive_losses},
@@ -133,7 +133,7 @@ class GuardRiskManager:
                 f"风控拒绝：日内亏损比例过高（{portfolio_state.daily_loss_pct:.4f} >= "
                 f"{self.config.max_daily_loss_pct:.4f}）"
             )
-            self.logger.info(reason)
+            self.logger.warning(reason)
             return RiskDecision.reject(
                 reject_reason=reason,
                 meta={"daily_loss_pct": portfolio_state.daily_loss_pct},
@@ -144,7 +144,7 @@ class GuardRiskManager:
                 f"风控拒绝：当前持仓数量过多（{portfolio_state.open_positions} >= "
                 f"{self.config.max_open_positions}）"
             )
-            self.logger.info(reason)
+            self.logger.debug(reason)
             return RiskDecision.reject(
                 reject_reason=reason,
                 meta={"open_positions": portfolio_state.open_positions},
@@ -155,7 +155,7 @@ class GuardRiskManager:
                 f"风控拒绝：风险占用过高（{portfolio_state.used_risk_pct:.4f} >= "
                 f"{self.config.max_used_risk_pct:.4f}）"
             )
-            self.logger.info(reason)
+            self.logger.debug(reason)
             return RiskDecision.reject(
                 reject_reason=reason,
                 meta={"used_risk_pct": portfolio_state.used_risk_pct},
@@ -166,7 +166,7 @@ class GuardRiskManager:
                 f"风控拒绝：候选信号 RR 过低（{signal.rr_estimate:.4f} < "
                 f"{self.config.min_rr:.4f}）"
             )
-            self.logger.info(reason)
+            self.logger.debug(reason)
             return RiskDecision.reject(reject_reason=reason, meta={"rr_estimate": signal.rr_estimate})
 
         if agent_decision.setup_score < self.config.min_setup_score:
@@ -174,7 +174,7 @@ class GuardRiskManager:
                 f"风控拒绝：Agent 评分过低（{agent_decision.setup_score:.4f} < "
                 f"{self.config.min_setup_score:.4f}）"
             )
-            self.logger.info(reason)
+            self.logger.debug(reason)
             return RiskDecision.reject(
                 reject_reason=reason,
                 meta={"setup_score": agent_decision.setup_score},
@@ -186,7 +186,7 @@ class GuardRiskManager:
                     f"风控拒绝：Agent 方向偏置（{agent_decision.direction_bias}）"
                     f"与候选信号方向（{signal.direction}）冲突"
                 )
-                self.logger.info(reason)
+                self.logger.debug(reason)
                 return RiskDecision.reject(
                     reject_reason=reason,
                     meta={
@@ -203,13 +203,12 @@ class GuardRiskManager:
 
         if approved_risk <= 0:
             reason = "风控拒绝：剩余风险容量不足，无法分配单笔风险"
-            self.logger.info(reason)
+            self.logger.debug(reason)
             return RiskDecision.reject(reject_reason=reason)
 
-        self.logger.info(
-            "风控通过：approved_risk=%.4f，default_risk_pct=%.4f，risk_adjustment=%.2f",
+        self.logger.debug(
+            "风控通过：approved_risk=%.4f，risk_adjustment=%.2f",
             approved_risk,
-            self.config.default_risk_pct,
             agent_decision.risk_adjustment,
         )
         return RiskDecision.approve(
