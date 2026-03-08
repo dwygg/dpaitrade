@@ -240,6 +240,7 @@ class BacktestEngine:
             final_equity=portfolio_state.equity,
         )
 
+        busy_until: Optional[datetime] = None
         cooldown_remaining = 0
         self.logger.info("开始执行回测，初始资金：%.2f", portfolio_state.equity)
         self.logger.info("当前 Agent：%s", self.agent.name)
@@ -259,6 +260,13 @@ class BacktestEngine:
                 market_state.d1_regime,
                 market_state.d1_bias,
             )
+
+            if busy_until is not None and market_state.ts < busy_until:
+                self.logger.info(
+                    "当前已有持仓覆盖此时刻，持仓结束时间=%s，跳过本步",
+                    busy_until,
+                )
+                continue
 
             if cooldown_remaining > 0:
                 self.logger.info(
@@ -342,6 +350,7 @@ class BacktestEngine:
                 continue
 
             result.trade_records.append(trade_record)
+            busy_until = trade_record.close_time
             result.total_trades += 1
 
             self._apply_trade_record(

@@ -12,6 +12,8 @@ from dpaitrade.execution import SimpleExecutionSimulator
 from dpaitrade.risk import GuardRiskManager, RiskGuardConfig
 from dpaitrade.strategy import (
     StrategyContext,
+    SwingPointPolicy,
+    SwingPointPolicyConfig,
     TrendContinuationPolicy,
     TrendContinuationPolicyConfig,
 )
@@ -67,10 +69,6 @@ def to_generic_bars(rows: list[OHLCRow]) -> list[GenericBar]:
 
 
 def estimate_atr_from_rows(rows: list[OHLCRow], period: int = 14) -> float:
-    """
-    当 CSV 没有 atr 列时，用最近 period 根 M15 估算一个 ATR，
-    避免策略中的 ATR 距离保护退化成接近 0。
-    """
     if len(rows) < 2:
         return 0.0
 
@@ -113,6 +111,104 @@ def build_future_path(
     future_low = min(row.low for row in future_rows)
     future_close = future_rows[-1].close
     return future_bars, future_high, future_low, future_close
+
+
+def build_execution_path(
+    rows: list[OHLCRow],
+    current_ts,
+    history_window: int,
+    forward_window: int,
+) -> list[dict]:
+    history = [r for r in rows if r.ts <= current_ts]
+    future = [r for r in rows if r.ts > current_ts]
+
+    history = history[-history_window:]
+    future = future[:forward_window]
+
+    merged = history + future
+    return [
+        {
+            "ts": r.ts,
+            "open": r.open,
+            "high": r.high,
+            "low": r.low,
+            "close": r.close,
+        }
+        for r in merged
+    ]
+
+
+def _dominant_components(
+    dominant_timeframe: str,
+    *,
+    d1_rows: list[OHLCRow],
+    h4_rows: list[OHLCRow],
+    m15_rows: list[OHLCRow],
+    d1_window_rows: list[OHLCRow],
+    h4_window_rows: list[OHLCRow],
+    m15_window_rows: list[OHLCRow],
+    d1_state,
+    h4_state,
+    m15_state,
+    d1_lookback: int,
+    h4_lookback: int,
+    m15_lookback: int,
+    current_ts,
+    future_window: int,
+):
+    analyzer_cfg_map = {
+        "high": {
+            "timeframe": "D1",
+            "min_bars": d1_lookback,
+            "lookback": d1_lookback,
+            "swing_window": 2,
+            "trend_threshold": 0.38,
+            "range_threshold": 0.58,
+            "near_boundary_atr_ratio": 0.35,
+        },
+        "mid": {
+            "timeframe": "H4",
+            "min_bars": h4_lookback,
+            "lookback": h4_lookback,
+            "swing_window": 2,
+            "trend_threshold": 0.36,
+            "range_threshold": 0.60,
+            "near_boundary_atr_ratio": 0.60,
+        },
+        "low": {
+            "timeframe": "M15",
+            "min_bars": m15_lookback,
+            "lookback": m15_lookback,
+            "swing_window": 2,
+            "trend_threshold": 0.34,
+            "range_threshold": 0.60,
+            "near_boundary_atr_ratio": 0.35,
+        },
+    }
+    mapping = {
+        "high": (d1_rows, d1_window_rows, d1_state, d1_lookback, max(4, future_window // 96 + 2)),
+        "mid": (h4_rows, h4_window_rows, h4_state, h4_lookback, max(8, future_window // 4 + 2)),
+        "low": (m15_rows, m15_window_rows, m15_state, m15_lookback, max(16, future_window + 2)),
+    }
+    rows, window_rows, state, lookback, forward_window = mapping.get(
+        dominant_timeframe,
+        mapping["low"],
+    )
+    exec_bars = build_execution_path(
+        rows=rows,
+        current_ts=current_ts,
+        history_window=lookback,
+        forward_window=forward_window,
+    )
+    return {
+        "rows": rows,
+        "window_rows": window_rows,
+        "state": state,
+        "lookback": lookback,
+        "exec_bars": exec_bars,
+        "analyzer_cfg": analyzer_cfg_map.get(dominant_timeframe, analyzer_cfg_map["low"]),
+    }
+
 
 def build_backtest_steps_from_csv(
     d1_rows: list[OHLCRow],
@@ -161,11 +257,16 @@ def build_backtest_steps_from_csv(
         )
     )
 
-    policy = TrendContinuationPolicy(
-        TrendContinuationPolicyConfig(
+    policy = SwingPointPolicy(
+        SwingPointPolicyConfig(
             allow_long=allow_long,
             allow_short=allow_short,
-            low_tf_range_entry_guard_atr_ratio=1.20,
+            dominant_timeframe="low",
+            swing_tf="mid",
+            entry_zone_atr_ratio=0.50,
+            stop_buffer_atr_ratio=0.15,
+            min_rr=1.5,
+            min_confirm_bar_body_atr_ratio=0.15,
         )
     )
 
@@ -176,10 +277,8 @@ def build_backtest_steps_from_csv(
     steps: list[BacktestStep] = []
     processed = 0
 
-    # ── 诊断计数器 ──────────────────────────────────────────────
     from collections import Counter
     diag: Counter = Counter()
-    # ────────────────────────────────────────────────────────────
 
     for idx, current_m15 in enumerate(m15_rows):
         current_ts = current_m15.ts
@@ -206,38 +305,53 @@ def build_backtest_steps_from_csv(
         h4_state = h4_analyzer.analyze(to_generic_bars(h4_window_rows))
         m15_state = m15_analyzer.analyze(to_generic_bars(m15_window_rows))
 
-        # ── 诊断：D1多头路径逐级过滤 ────────────────────────────
-        diag[f"D1 bias={d1_state.primary_bias}"] += 1
-        if d1_state.primary_bias == "long":
-            # 过滤1: reversal_candidate
-            if d1_state.phase == "reversal_candidate":
-                diag["LONG过滤@D1 phase=reversal_candidate"] += 1
-            # 过滤2: trend_score
-            elif d1_state.trend_score < policy.config.min_trend_score_high_tf:
-                diag[f"LONG过滤@D1 trend_score不足(score={d1_state.trend_score:.2f})"] += 1
-            else:
-                # D1 通过
-                # 过滤3: H4 in_value_zone
-                if not h4_state.in_value_zone:
-                    diag["LONG过滤@H4 not in_value_zone"] += 1
-                # 过滤4: H4 reversal_warning
-                elif h4_state.reversal_warning:
-                    diag["LONG过滤@H4 reversal_warning"] += 1
-                else:
-                    # H4 通过，检查 constraint_lower 距离
-                    _atr_tmp = float(current_m15.meta.get("atr", 0.0) or 0.0)
-                    _mid_price = h4_window_rows[-1].close if h4_window_rows else current_m15.close
-                    _max_dist = max(_atr_tmp * policy.config.low_tf_range_entry_guard_atr_ratio, 1e-8)
-                    if h4_state.constraint_lower is not None:
-                        _dist = max(_mid_price - h4_state.constraint_lower, 0.0)
-                        if _dist > _max_dist:
-                            diag[f"LONG过滤@H4距下缘过远(dist={_dist:.1f} max={_max_dist:.1f})"] += 1
-                            diag["LONG过滤@H4距下缘过远[汇总]"] += 1
-                        else:
-                            diag["LONG通过H4距离检查→进入M15触发器"] += 1
-                    else:
-                        diag["LONG通过H4距离检查(无constraint_lower)→进入M15触发器"] += 1
-        # ────────────────────────────────────────────────────────
+        dominant = {
+            "high": d1_state,
+            "mid": h4_state,
+            "low": m15_state,
+        }.get(policy.config.dominant_timeframe, m15_state)
+        diag[f"dominant_tf={policy.config.dominant_timeframe}"] += 1
+        diag[f"dominant_bias={dominant.primary_bias}"] += 1
+        diag[f"dominant_phase={dominant.phase}"] += 1
+        diag[f"h4_bias={h4_state.primary_bias}"] += 1
+        diag[f"h4_phase={h4_state.phase}"] += 1
+        diag[f"d1_bias={d1_state.primary_bias}"] += 1
+        diag[f"d1_phase={d1_state.phase}"] += 1
+        htf_state = {"high": d1_state, "mid": h4_state}.get(
+            policy.config.higher_tf_for_align if policy.config.require_higher_tf_bias_align else ""
+        )
+        if dominant.primary_bias == "neutral":
+            diag["过滤@主导周期 bias=neutral"] += 1
+        elif dominant.phase == "reversal_candidate":
+            diag["过滤@主导周期 phase=reversal_candidate"] += 1
+        elif policy.config.allowed_phases and dominant.phase not in policy.config.allowed_phases:
+            diag[f"过滤@allowed_phases phase={dominant.phase!r}"] += 1
+        elif dominant.trend_score < policy.config.min_trend_score_trading_tf:
+            diag[f"过滤@trend_score({dominant.trend_score:.2f}<{policy.config.min_trend_score_trading_tf})"] += 1
+        elif htf_state is not None and htf_state.primary_bias != dominant.primary_bias:
+            diag[f"过滤@高周期对齐 htf={htf_state.primary_bias!r}≠dominant={dominant.primary_bias!r}"] += 1
+        else:
+            diag["通过@全部状态过滤"] += 1
+
+        dominant_pack = _dominant_components(
+            policy.config.dominant_timeframe,
+            d1_rows=d1_rows,
+            h4_rows=h4_rows,
+            m15_rows=m15_rows,
+            d1_window_rows=d1_window_rows,
+            h4_window_rows=h4_window_rows,
+            m15_window_rows=m15_window_rows,
+            d1_state=d1_state,
+            h4_state=h4_state,
+            m15_state=m15_state,
+            d1_lookback=d1_lookback,
+            h4_lookback=h4_lookback,
+            m15_lookback=m15_lookback,
+            current_ts=current_ts,
+            future_window=future_window,
+        )
+
+        h4_atr = estimate_atr_from_rows(h4_window_rows) if h4_window_rows else 0.0
 
         ctx = StrategyContext(
             ts=current_ts,
@@ -248,6 +362,8 @@ def build_backtest_steps_from_csv(
             volatility_score=volatility_score,
             mid_price=h4_window_rows[-1].close if h4_window_rows else current_m15.close,
             low_tf_bars=to_generic_bars(m15_window_rows),
+            dominant_tf_bars=to_generic_bars(dominant_pack["window_rows"]),
+            higher_tf_atr=h4_atr,
         )
 
         candidate_signal = policy.generate_signal(
@@ -263,13 +379,6 @@ def build_backtest_steps_from_csv(
             future_window=future_window,
         )
 
-        h4_exec_bars = build_h4_execution_path(
-                h4_rows=h4_rows,
-                current_ts=current_ts,
-                history_window=h4_lookback,
-                forward_window=max(8, future_window // 4 + 2),
-        )
-        # 使用 D1 作为主市场状态，中周期/低周期状态写入 meta，供后续分析使用
         market_state = _build_market_state_from_structure(
             symbol=symbol,
             state=d1_state,
@@ -277,11 +386,13 @@ def build_backtest_steps_from_csv(
             atr=atr,
             spread=spread,
             volatility_score=volatility_score,
-
             extra_meta={
                 "h4_state": h4_state,
                 "m15_state": m15_state,
-                "h4_exec_bars": h4_exec_bars,
+                "dominant_state": dominant_pack["state"],
+                "dominant_timeframe": policy.config.dominant_timeframe,
+                "dominant_exec_bars": dominant_pack["exec_bars"],
+                "dominant_analyzer_cfg": dominant_pack["analyzer_cfg"],
                 "future_bars": future_bars,
                 "future_high": future_high,
                 "future_low": future_low,
@@ -302,7 +413,6 @@ def build_backtest_steps_from_csv(
 
     print(f"[信息] 多步回测数据构造完成，总步数={len(steps)}")
 
-    # ── 诊断报告写入文件 ─────────────────────────────────────────
     import sys
     diag_path = "backtest_diag.txt"
     with open(diag_path, "w", encoding="utf-8") as _f:
@@ -313,7 +423,6 @@ def build_backtest_steps_from_csv(
     print(f"[诊断] 过滤分布已写入 {diag_path}", flush=True)
     sys.stderr.write(f"[诊断] 过滤分布已写入 {diag_path}\n")
     sys.stderr.flush()
-    # ────────────────────────────────────────────────────────────
 
     return steps
 
@@ -350,39 +459,6 @@ def _build_market_state_from_structure(
         },
     )
     return market_state
-
-def build_h4_execution_path(
-    h4_rows: list[OHLCRow],
-    current_ts,
-    history_window: int = 24,
-    forward_window: int = 8,
-) -> list[dict]:
-    """
-    为执行模拟器构造 H4 路径：
-    - 包含当前时刻之前的历史 H4 bars
-    - 以及当前时刻之后的未来 H4 bars
-
-    用途：
-    - 让模拟器在持仓过程中按“已完成 H4 bar”更新 trailing stop
-    - 判断 H4 波段失效
-    """
-    history = [r for r in h4_rows if r.ts <= current_ts]
-    future = [r for r in h4_rows if r.ts > current_ts]
-
-    history = history[-history_window:]
-    future = future[:forward_window]
-
-    rows = history + future
-    return [
-        {
-            "ts": r.ts,
-            "open": r.open,
-            "high": r.high,
-            "low": r.low,
-            "close": r.close,
-        }
-        for r in rows
-    ]
 
 
 def build_agent(agent_name: str):

@@ -6,47 +6,41 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from dpaitrade.core.types import CandidateSignal, MarketState, PortfolioState, RiskDecision, TradeRecord
+from dpaitrade.structure import GenericBar, StructureAnalyzer, StructureAnalyzerConfig
 
 
 @dataclass(slots=True)
 class SimulationConfig:
-    """
-    执行模拟配置（H4结构 trailing 版）。
-
-    逻辑：
-    1. 初始止损
-    2. 最大浮盈达到 1.5R 后，止损移到保本
-    3. 保本后，仅允许 H4 结构 trailing stop 收紧
-    4. H4 波段失效离场
-    5. 到期按 future_close 平仓
-    """
-
     fee_rate: float = 0.0002
     slippage: float = 0.0
-
     fallback_exit_to_entry: bool = True
     default_holding_minutes: int = 15
 
-    # 达到 1.5R 后移到保本
     break_even_trigger_r: float = 1.5
     break_even_offset: float = 0.0
 
-    # H4 trailing stop
-    h4_bar_hours: int = 4
     trailing_buffer_atr_ratio: float = 0.10
     trailing_buffer_spread_multiple: float = 1.0
 
-    # H4 失效离场确认
-    h4_invalid_confirm_bars: int = 2
+    dominant_invalid_confirm_bars: int = 1
+
+    progress_check_minutes: int = 180
+    min_progress_r_after_progress_check: float = 0.30
+
+    max_holding_minutes: int = 720
+    min_unrealized_r_at_max_holding: float = 0.10
 
 
 class SimpleExecutionSimulator:
-    """
-    顺势执行模拟器（H4 trailing 版）。
+    """顺势执行模拟器（主导周期一致性版）。
 
-    注意：
-    - M15 不再参与离场
-    - H4 负责波段结构 trailing 与失效离场
+    逻辑：
+    1. 初始止损
+    2. 达到 break-even trigger 后移到保本
+    3. 保本后，按主导周期已完成 bar 收紧 trailing stop
+    4. 主导周期结构失效离场
+    5. 持仓时长 + 盈亏判断离场
+    6. 到期按 future_close 平仓
     """
 
     def __init__(
@@ -62,7 +56,6 @@ class SimpleExecutionSimulator:
         logger = logging.getLogger("dpaitrade.execution.simulator")
         if logger.handlers:
             return logger
-
         logger.setLevel(logging.INFO)
         handler = logging.StreamHandler()
         formatter = logging.Formatter(
@@ -84,7 +77,6 @@ class SimpleExecutionSimulator:
         if not risk_decision.approved:
             self.logger.info("执行模拟跳过：风控未通过")
             return None
-
         if signal.direction not in ("long", "short"):
             self.logger.info("执行模拟跳过：候选信号方向无效")
             return None
@@ -100,7 +92,10 @@ class SimpleExecutionSimulator:
             return None
 
         future_bars = market_state.meta.get("future_bars", [])
-        h4_exec_bars = market_state.meta.get("h4_exec_bars", [])
+        dominant_exec_bars = market_state.meta.get("dominant_exec_bars", [])
+        dominant_state = market_state.meta.get("dominant_state")
+        dominant_analyzer_cfg = market_state.meta.get("dominant_analyzer_cfg", {})
+
         if not future_bars:
             return self._fallback_execute_with_legacy_fields(
                 market_state=market_state,
@@ -114,14 +109,12 @@ class SimpleExecutionSimulator:
         initial_stop = signal.stop_loss
         current_stop = initial_stop
         initial_risk = abs(entry_price - initial_stop)
-
         if initial_risk <= 0:
             self.logger.info("执行模拟跳过：初始风险距离无效")
             return None
 
         atr = float(market_state.atr or 0.0)
         spread = float(market_state.spread or 0.0)
-
         trailing_buffer = max(
             atr * self.config.trailing_buffer_atr_ratio,
             spread * self.config.trailing_buffer_spread_multiple,
@@ -129,12 +122,15 @@ class SimpleExecutionSimulator:
 
         break_even_armed = False
         m15_history: list[dict] = []
-
         exit_price: Optional[float] = None
         close_reason = ""
         close_time: Optional[datetime] = None
 
-        mid_tf_state = market_state.meta.get("h4_state")
+        dominant_timeframe = None
+        if dominant_state is not None:
+            dominant_timeframe = getattr(dominant_state, "timeframe", None)
+        if not dominant_timeframe:
+            dominant_timeframe = market_state.meta.get("dominant_timeframe", "M15")
 
         for bar in future_bars:
             bar_ts = bar["ts"]
@@ -143,7 +139,6 @@ class SimpleExecutionSimulator:
             bar_low = float(bar["low"])
             bar_close = float(bar["close"])
 
-            # 1) 当前 stop 是否被打到
             if signal.direction == "short":
                 if bar_high >= current_stop:
                     exit_price = current_stop + self.config.slippage
@@ -154,6 +149,11 @@ class SimpleExecutionSimulator:
                         close_reason = "移动止损"
                     else:
                         close_reason = "命中止损"
+                    break
+                if signal.take_profit is not None and bar_low <= signal.take_profit:
+                    exit_price = signal.take_profit + self.config.slippage
+                    close_time = bar_ts
+                    close_reason = "命中止盈"
                     break
             else:
                 if bar_low <= current_stop:
@@ -166,8 +166,12 @@ class SimpleExecutionSimulator:
                     else:
                         close_reason = "命中止损"
                     break
+                if signal.take_profit is not None and bar_high >= signal.take_profit:
+                    exit_price = signal.take_profit - self.config.slippage
+                    close_time = bar_ts
+                    close_reason = "命中止盈"
+                    break
 
-            # 更新 M15 路径历史（仅用于浮盈计算，不用于离场）
             m15_history.append(
                 {
                     "ts": bar_ts,
@@ -178,34 +182,39 @@ class SimpleExecutionSimulator:
                 }
             )
 
-            # 2) 最大浮盈达到 1.5R 后移到保本
-            if not break_even_armed:
-                max_favorable_move = self._calc_max_favorable_move(
-                    direction=signal.direction,
-                    entry_price=entry_price,
-                    history=m15_history,
-                )
-                if max_favorable_move >= initial_risk * self.config.break_even_trigger_r:
-                    break_even_armed = True
-                    current_stop = self._break_even_price(entry_price, signal.direction)
-                    self.logger.info(
-                        "触发保本：direction=%s，entry=%.5f，new_stop=%.5f，达到%.2fR",
-                        signal.direction,
-                        entry_price,
-                        current_stop,
-                        self.config.break_even_trigger_r,
-                    )
-
-            # 3) 获取当前时刻之前“已完成”的 H4 bars
-            closed_h4_bars = self._collect_closed_h4_bars(
-                h4_exec_bars=h4_exec_bars,
-                current_ts=bar_ts,
+            max_favorable_move = self._calc_max_favorable_move(
+                direction=signal.direction,
+                entry_price=entry_price,
+                history=m15_history,
+            )
+            best_favorable_r = max_favorable_move / max(initial_risk, 1e-8)
+            current_unrealized_r = self._calc_unrealized_r(
+                direction=signal.direction,
+                entry_price=entry_price,
+                current_price=bar_close,
+                initial_risk=initial_risk,
             )
 
-            # 4) 保本后，只允许 H4 结构 trailing
+            if not break_even_armed and best_favorable_r >= self.config.break_even_trigger_r:
+                break_even_armed = True
+                current_stop = self._break_even_price(entry_price, signal.direction)
+                self.logger.info(
+                    "触发保本：direction=%s，entry=%.5f，new_stop=%.5f，达到%.2fR",
+                    signal.direction,
+                    entry_price,
+                    current_stop,
+                    self.config.break_even_trigger_r,
+                )
+
+            closed_exec_bars = self._collect_closed_exec_bars(
+                exec_bars=dominant_exec_bars,
+                current_ts=bar_ts,
+                timeframe=dominant_timeframe,
+            )
+
             if break_even_armed:
-                new_stop = self._calc_h4_trailing_stop(
-                    closed_h4_bars=closed_h4_bars,
+                new_stop = self._calc_dominant_trailing_stop(
+                    closed_exec_bars=closed_exec_bars,
                     direction=signal.direction,
                     current_stop=current_stop,
                     trailing_buffer=trailing_buffer,
@@ -213,22 +222,28 @@ class SimpleExecutionSimulator:
                 if new_stop is not None:
                     current_stop = new_stop
 
-            # 5) H4 失效离场（不依赖 M15）
-            if self._detect_h4_invalidation_exit(
+            if self._detect_dominant_invalidation_exit(
                 direction=signal.direction,
-                closed_h4_bars=closed_h4_bars,
-                mid_tf_state=mid_tf_state,
+                closed_exec_bars=closed_exec_bars,
+                dominant_analyzer_cfg=dominant_analyzer_cfg,
             ):
-                exit_price = (
-                    bar_close + self.config.slippage
-                    if signal.direction == "short"
-                    else bar_close - self.config.slippage
-                )
+                exit_price = self._apply_exit_slippage(signal.direction, bar_close)
                 close_time = bar_ts
-                close_reason = "H4失效离场"
+                close_reason = "主导周期失效离场"
                 break
 
-        # 6) 到期按最后一根 future_close 离场
+            timed_exit_reason = self._detect_time_and_pnl_exit(
+                entry_ts=market_state.ts,
+                current_ts=bar_ts,
+                best_favorable_r=best_favorable_r,
+                current_unrealized_r=current_unrealized_r,
+            )
+            if timed_exit_reason:
+                exit_price = self._apply_exit_slippage(signal.direction, bar_close)
+                close_time = bar_ts
+                close_reason = timed_exit_reason
+                break
+
         if exit_price is None:
             if future_bars:
                 last_bar = future_bars[-1]
@@ -270,7 +285,6 @@ class SimpleExecutionSimulator:
             pnl,
             close_reason,
         )
-
         return TradeRecord(
             symbol=signal.symbol,
             direction=signal.direction,
@@ -292,20 +306,29 @@ class SimpleExecutionSimulator:
             },
         )
 
-    def _collect_closed_h4_bars(self, h4_exec_bars: list[dict], current_ts: datetime) -> list[dict]:
-        """
-        收集当前时刻之前已经完成的 H4 bars。
-
-        约定：
-        - h4_exec_bars 中的 ts 是 H4 bar 的开盘时间
-        - 只有 ts + 4h <= current_ts，才认为该 H4 bar 已完成
-        """
+    def _collect_closed_exec_bars(
+        self,
+        exec_bars: list[dict],
+        current_ts: datetime,
+        timeframe: str,
+    ) -> list[dict]:
         closed: list[dict] = []
-        for bar in h4_exec_bars:
-            bar_end = bar["ts"] + timedelta(hours=self.config.h4_bar_hours)
+        bar_delta = timedelta(minutes=self._timeframe_minutes(timeframe))
+        for bar in exec_bars:
+            bar_end = bar["ts"] + bar_delta
             if bar_end <= current_ts:
                 closed.append(bar)
         return closed
+
+    @staticmethod
+    def _timeframe_minutes(timeframe: str) -> int:
+        tf = (timeframe or "M15").upper()
+        mapping = {
+            "M15": 15,
+            "H4": 240,
+            "D1": 1440,
+        }
+        return mapping.get(tf, 15)
 
     def _calc_max_favorable_move(
         self,
@@ -317,6 +340,17 @@ class SimpleExecutionSimulator:
             return entry_price - min(h["low"] for h in history)
         return max(h["high"] for h in history) - entry_price
 
+    @staticmethod
+    def _calc_unrealized_r(
+        direction: str,
+        entry_price: float,
+        current_price: float,
+        initial_risk: float,
+    ) -> float:
+        if direction == "short":
+            return (entry_price - current_price) / max(initial_risk, 1e-8)
+        return (current_price - entry_price) / max(initial_risk, 1e-8)
+
     def _break_even_price(self, entry_price: float, direction: str) -> float:
         if direction == "short":
             return entry_price - self.config.break_even_offset
@@ -326,29 +360,17 @@ class SimpleExecutionSimulator:
     def _is_break_even_stop(current_stop: float, entry_price: float) -> bool:
         return abs(current_stop - entry_price) < 1e-8
 
-    def _calc_h4_trailing_stop(
+    def _calc_dominant_trailing_stop(
         self,
-        closed_h4_bars: list[dict],
+        closed_exec_bars: list[dict],
         direction: str,
         current_stop: float,
         trailing_buffer: float,
     ) -> Optional[float]:
-        """
-        H4 结构 trailing stop：
-
-        short:
-        - 用最近一根已完成 H4 bar 的高点 + buffer 作为新的结构止损
-        - 仅允许向下收紧
-
-        long:
-        - 用最近一根已完成 H4 bar 的低点 - buffer
-        - 仅允许向上收紧
-        """
-        if not closed_h4_bars:
+        if not closed_exec_bars:
             return None
 
-        last_closed = closed_h4_bars[-1]
-
+        last_closed = closed_exec_bars[-1]
         if direction == "short":
             candidate = float(last_closed["high"]) + trailing_buffer
             return candidate if candidate < current_stop else current_stop
@@ -356,37 +378,89 @@ class SimpleExecutionSimulator:
         candidate = float(last_closed["low"]) - trailing_buffer
         return candidate if candidate > current_stop else current_stop
 
-    def _detect_h4_invalidation_exit(self, direction: str, closed_h4_bars: list[dict], mid_tf_state) -> bool:
-        """
-        H4 波段失效离场：
-
-        short:
-        - 连续 N 根已完成 H4 收盘 > constraint_upper + tolerance
-
-        long:
-        - 连续 N 根已完成 H4 收盘 < constraint_lower - tolerance
-        """
-        if mid_tf_state is None:
+    def _detect_dominant_invalidation_exit(
+        self,
+        direction: str,
+        closed_exec_bars: list[dict],
+        dominant_analyzer_cfg: dict,
+    ) -> bool:
+        if not closed_exec_bars or not dominant_analyzer_cfg:
             return False
 
-        confirm_n = self.config.h4_invalid_confirm_bars
-        if len(closed_h4_bars) < confirm_n:
+        confirm_n = max(int(self.config.dominant_invalid_confirm_bars), 1)
+        lookback = int(dominant_analyzer_cfg.get("lookback", 0) or 0)
+        if lookback <= 0 or len(closed_exec_bars) < lookback:
             return False
 
-        recent = closed_h4_bars[-confirm_n:]
-
-        upper = getattr(mid_tf_state, "constraint_upper", None)
-        lower = getattr(mid_tf_state, "constraint_lower", None)
-        tol = float(getattr(mid_tf_state, "boundary_tolerance", 0.0) or 0.0)
-
-        if direction == "short":
-            if upper is None:
+        invalid_flags: list[bool] = []
+        for offset in range(confirm_n):
+            usable = len(closed_exec_bars) - offset
+            if usable < lookback:
                 return False
-            return all(float(bar["close"]) > upper + tol for bar in recent)
+            window = closed_exec_bars[:usable][-lookback:]
+            state = self._analyze_exec_window(window, dominant_analyzer_cfg)
+            if direction == "long":
+                invalid_flags.append(
+                    state.primary_bias == "short" or state.phase == "reversal_candidate"
+                )
+            else:
+                invalid_flags.append(
+                    state.primary_bias == "long" or state.phase == "reversal_candidate"
+                )
+        return all(invalid_flags)
 
-        if lower is None:
-            return False
-        return all(float(bar["close"]) < lower - tol for bar in recent)
+    def _analyze_exec_window(self, window: list[dict], analyzer_cfg: dict):
+        bars = [
+            GenericBar(
+                ts=bar["ts"],
+                open=float(bar["open"]),
+                high=float(bar["high"]),
+                low=float(bar["low"]),
+                close=float(bar["close"]),
+            )
+            for bar in window
+        ]
+        analyzer = StructureAnalyzer(
+            StructureAnalyzerConfig(
+                timeframe=analyzer_cfg.get("timeframe", "M15"),
+                min_bars=int(analyzer_cfg.get("min_bars", len(bars))),
+                lookback=int(analyzer_cfg.get("lookback", len(bars))),
+                swing_window=int(analyzer_cfg.get("swing_window", 2)),
+                trend_threshold=float(analyzer_cfg.get("trend_threshold", 0.34)),
+                range_threshold=float(analyzer_cfg.get("range_threshold", 0.60)),
+                near_boundary_atr_ratio=float(analyzer_cfg.get("near_boundary_atr_ratio", 0.35)),
+            )
+        )
+        return analyzer.analyze(bars)
+
+    def _detect_time_and_pnl_exit(
+        self,
+        entry_ts: datetime,
+        current_ts: datetime,
+        best_favorable_r: float,
+        current_unrealized_r: float,
+    ) -> str:
+        elapsed_minutes = int((current_ts - entry_ts).total_seconds() // 60)
+
+        if (
+            elapsed_minutes >= self.config.progress_check_minutes
+            and best_favorable_r < self.config.min_progress_r_after_progress_check
+            and current_unrealized_r <= 0.0
+        ):
+            return "持仓进展不足离场"
+
+        if (
+            elapsed_minutes >= self.config.max_holding_minutes
+            and current_unrealized_r < self.config.min_unrealized_r_at_max_holding
+        ):
+            return "持仓超时离场"
+
+        return ""
+
+    def _apply_exit_slippage(self, direction: str, price: float) -> float:
+        if direction == "short":
+            return price + self.config.slippage
+        return price - self.config.slippage
 
     def _fallback_execute_with_legacy_fields(
         self,
@@ -425,7 +499,6 @@ class SimpleExecutionSimulator:
         fees = self._calculate_fees(signal.entry_price, exit_price, quantity)
         pnl = self._calculate_pnl(signal.direction, signal.entry_price, exit_price, quantity, fees)
         pnl_r = self._calculate_r_multiple(pnl, portfolio_state.equity, risk_decision.risk_pct)
-
         return TradeRecord(
             symbol=signal.symbol,
             direction=signal.direction,

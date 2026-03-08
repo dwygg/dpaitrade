@@ -7,10 +7,18 @@ strategy 包。
 - TrendContinuationPolicy
 """
 
-from .policy import StrategyContext, TrendContinuationPolicy, TrendContinuationPolicyConfig
+from .policy import (
+    StrategyContext,
+    SwingPointPolicy,
+    SwingPointPolicyConfig,
+    TrendContinuationPolicy,
+    TrendContinuationPolicyConfig,
+)
 
 __all__ = [
     "StrategyContext",
+    "SwingPointPolicy",
+    "SwingPointPolicyConfig",
     "TrendContinuationPolicy",
     "TrendContinuationPolicyConfig",
 ]
