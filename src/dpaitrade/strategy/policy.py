@@ -589,29 +589,107 @@ class SwingPointPolicy:
     def _in_zone(self, price: float, level: float, zone: float) -> bool:
         return abs(price - level) <= zone
 
-    def _confirm_long(self, ctx: StrategyContext) -> tuple[bool, str]:
-        bars = ctx.dominant_tf_bars or ctx.low_tf_bars or []
-        if not bars:
-            return False, "无 M15 确认 bars"
+    def _confirm_long(
+        self,
+        swing: StructureState,
+        ctx: StrategyContext,
+        zone: float,
+    ) -> tuple[bool, str]:
+        bars = self._recent_low_bars(ctx)
+        if len(bars) < 2:
+            return False, "M15 确认 bars 不足"
         last = bars[-1]
-        if last.close <= last.open:
-            return False, "最后一根不是阳线"
-        body = last.close - last.open
-        if body < ctx.atr * self.config.min_confirm_bar_body_atr_ratio:
-            return False, f"阳线实体过小 body={body:.2f}"
-        return True, "ok"
+        prev = bars[-2]
+        atr = max(ctx.atr, ctx.spread, 1e-8)
+        level = float(swing.last_swing_low)
+        reclaim_buffer = max(atr * self.config.reclaim_buffer_atr_ratio, ctx.spread)
+        confirm_buffer = atr * self.config.confirm_break_buffer_atr_ratio
+        touch_band = max(atr * self.config.sweep_touch_atr_ratio, ctx.spread)
 
-    def _confirm_short(self, ctx: StrategyContext) -> tuple[bool, str]:
-        bars = ctx.dominant_tf_bars or ctx.low_tf_bars or []
-        if not bars:
-            return False, "无 M15 确认 bars"
+        recent = bars[-max(int(self.config.recent_touch_bars), 1):]
+        recent_min_low = min(b.low for b in recent)
+        if recent_min_low > level + touch_band:
+            return False, "最近几根 M15 未真正扫到摆低附近"
+        if last.close <= last.open:
+            return False, "最后一根不是确认阳线"
+        body = last.close - last.open
+        if body < atr * self.config.min_confirm_bar_body_atr_ratio:
+            return False, f"确认阳线实体过小 body={body:.5f}"
+        if last.close <= level + reclaim_buffer:
+            return False, "最后一根未有效收回摆低之上"
+        if last.close <= (last.high + last.low) / 2:
+            return False, "确认阳线收盘位置偏弱"
+
+        swept = recent_min_low <= level + touch_band
+        reclaimed = last.close > level + reclaim_buffer
+        broke_prev = last.close > prev.high + confirm_buffer
+        strong_reject = (
+            last.low <= level + touch_band
+            and last.close > max(prev.close, level + reclaim_buffer)
+        ) or (
+            recent_min_low < level and last.close > prev.close + confirm_buffer
+        )
+        if not swept:
+            return False, "最近几根没有充分回踩到摆低"
+        if not reclaimed:
+            return False, "最近确认 bar 未完成有效收回"
+        if not (broke_prev or strong_reject):
+            return False, "缺少足够明确的扫低回收确认"
+        return True, (
+            f"M15 多头确认：摆低={level:.5f}，prev_high={prev.high:.5f}，"
+            f"last_close={last.close:.5f}"
+        )
+
+    def _confirm_short(
+        self,
+        swing: StructureState,
+        ctx: StrategyContext,
+        zone: float,
+    ) -> tuple[bool, str]:
+        bars = self._recent_low_bars(ctx)
+        if len(bars) < 2:
+            return False, "M15 确认 bars 不足"
         last = bars[-1]
+        prev = bars[-2]
+        atr = max(ctx.atr, ctx.spread, 1e-8)
+        level = float(swing.last_swing_high)
+        reclaim_buffer = max(atr * self.config.reclaim_buffer_atr_ratio, ctx.spread)
+        confirm_buffer = atr * self.config.confirm_break_buffer_atr_ratio
+        touch_band = max(atr * self.config.sweep_touch_atr_ratio, ctx.spread)
+
+        recent = bars[-max(int(self.config.recent_touch_bars), 1):]
+        recent_max_high = max(b.high for b in recent)
+        if recent_max_high < level - touch_band:
+            return False, "最近几根 M15 未真正扫到摆高附近"
         if last.close >= last.open:
-            return False, "最后一根不是阴线"
+            return False, "最后一根不是确认阴线"
         body = last.open - last.close
-        if body < ctx.atr * self.config.min_confirm_bar_body_atr_ratio:
-            return False, f"阴线实体过小 body={body:.2f}"
-        return True, "ok"
+        if body < atr * self.config.min_confirm_bar_body_atr_ratio:
+            return False, f"确认阴线实体过小 body={body:.5f}"
+        if last.close >= level - reclaim_buffer:
+            return False, "最后一根未有效收回摆高之下"
+        if last.close >= (last.high + last.low) / 2:
+            return False, "确认阴线收盘位置偏弱"
+
+        swept = recent_max_high >= level - touch_band
+        reclaimed = last.close < level - reclaim_buffer
+        broke_prev = last.close < prev.low - confirm_buffer
+        strong_reject = (
+            last.high >= level - touch_band
+            and last.close < min(prev.close, level - reclaim_buffer)
+        ) or (
+            recent_max_high > level and last.close < prev.close - confirm_buffer
+        )
+        if not swept:
+            return False, "最近几根没有充分反弹到摆高"
+        if not reclaimed:
+            return False, "最近确认 bar 未完成有效收回"
+        if not (broke_prev or strong_reject):
+            return False, "缺少足够明确的扫高回落确认"
+        return True, (
+            f"M15 空头确认：摆高={level:.5f}，prev_low={prev.low:.5f}，"
+            f"last_close={last.close:.5f}"
+        )
 
     def generate_signal(
         self,
@@ -804,11 +882,17 @@ class SwingPointPolicyConfig:
     stop_buffer_spread_multiple: float = 1.5
 
     min_rr: float = 1.80
+    max_rr: float = 4.00
 
     min_confirm_bar_body_atr_ratio: float = 0.15
     reclaim_buffer_atr_ratio: float = 0.02
     confirm_break_buffer_atr_ratio: float = 0.02
-    recent_touch_bars: int = 2
+    sweep_touch_atr_ratio: float = 0.08
+    recent_touch_bars: int = 3
+
+    max_attempts_per_swing: int = 2
+    max_cumulative_loss_r_per_swing: float = 1.50
+    require_reset_after_loss: bool = True
 
     use_higher_tf_veto: bool = True
     veto_timeframe: str = "high"
@@ -898,10 +982,12 @@ class SwingPointPolicy:
         level = float(swing.last_swing_low)
         reclaim_buffer = max(atr * self.config.reclaim_buffer_atr_ratio, ctx.spread)
         confirm_buffer = atr * self.config.confirm_break_buffer_atr_ratio
+        touch_band = max(atr * self.config.sweep_touch_atr_ratio, ctx.spread)
 
         recent = bars[-max(int(self.config.recent_touch_bars), 1):]
-        if min(b.low for b in recent) > level + zone:
-            return False, "最近几根 M15 未真正触及摆低回踩带"
+        recent_min_low = min(b.low for b in recent)
+        if recent_min_low > level + touch_band:
+            return False, "最近几根 M15 未真正扫到摆低附近"
         if last.close <= last.open:
             return False, "最后一根不是确认阳线"
         body = last.close - last.open
@@ -912,10 +998,21 @@ class SwingPointPolicy:
         if last.close <= (last.high + last.low) / 2:
             return False, "确认阳线收盘位置偏弱"
 
+        swept = recent_min_low <= level + touch_band
+        reclaimed = last.close > level + reclaim_buffer
         broke_prev = last.close > prev.high + confirm_buffer
-        strong_reject = last.low <= level + zone and last.close > max(prev.close, level + reclaim_buffer)
+        strong_reject = (
+            last.low <= level + touch_band
+            and last.close > max(prev.close, level + reclaim_buffer)
+        ) or (
+            recent_min_low < level and last.close > prev.close + confirm_buffer
+        )
+        if not swept:
+            return False, "最近几根没有充分回踩到摆低"
+        if not reclaimed:
+            return False, "最近确认 bar 未完成有效收回"
         if not (broke_prev or strong_reject):
-            return False, "缺少足够明确的拒绝/收回确认"
+            return False, "缺少足够明确的扫低回收确认"
         return True, (
             f"M15 多头确认：摆低={level:.5f}，prev_high={prev.high:.5f}，"
             f"last_close={last.close:.5f}"
@@ -936,10 +1033,12 @@ class SwingPointPolicy:
         level = float(swing.last_swing_high)
         reclaim_buffer = max(atr * self.config.reclaim_buffer_atr_ratio, ctx.spread)
         confirm_buffer = atr * self.config.confirm_break_buffer_atr_ratio
+        touch_band = max(atr * self.config.sweep_touch_atr_ratio, ctx.spread)
 
         recent = bars[-max(int(self.config.recent_touch_bars), 1):]
-        if max(b.high for b in recent) < level - zone:
-            return False, "最近几根 M15 未真正触及摆高反弹带"
+        recent_max_high = max(b.high for b in recent)
+        if recent_max_high < level - touch_band:
+            return False, "最近几根 M15 未真正扫到摆高附近"
         if last.close >= last.open:
             return False, "最后一根不是确认阴线"
         body = last.open - last.close
@@ -950,10 +1049,21 @@ class SwingPointPolicy:
         if last.close >= (last.high + last.low) / 2:
             return False, "确认阴线收盘位置偏弱"
 
+        swept = recent_max_high >= level - touch_band
+        reclaimed = last.close < level - reclaim_buffer
         broke_prev = last.close < prev.low - confirm_buffer
-        strong_reject = last.high >= level - zone and last.close < min(prev.close, level - reclaim_buffer)
+        strong_reject = (
+            last.high >= level - touch_band
+            and last.close < min(prev.close, level - reclaim_buffer)
+        ) or (
+            recent_max_high > level and last.close < prev.close - confirm_buffer
+        )
+        if not swept:
+            return False, "最近几根没有充分反弹到摆高"
+        if not reclaimed:
+            return False, "最近确认 bar 未完成有效收回"
         if not (broke_prev or strong_reject):
-            return False, "缺少足够明确的拒绝/收回确认"
+            return False, "缺少足够明确的扫高回落确认"
         return True, (
             f"M15 空头确认：摆高={level:.5f}，prev_low={prev.low:.5f}，"
             f"last_close={last.close:.5f}"
@@ -1031,6 +1141,9 @@ class SwingPointPolicy:
         if rr < self.config.min_rr:
             self.logger.info("摆点多头：R:R=%.2f < min=%.2f，跳过", rr, self.config.min_rr)
             return None
+        if self.config.max_rr > 0 and rr > self.config.max_rr:
+            tp = entry + risk * self.config.max_rr
+            rr = self.config.max_rr
         return CandidateSignal(
             ts=ctx.ts,
             symbol=ctx.symbol,
@@ -1051,7 +1164,12 @@ class SwingPointPolicy:
                 "dominant_tf": self.config.dominant_timeframe,
                 "swing_low": swing_low,
                 "swing_high": tp,
+                "zone_lower": swing_low,
                 "zone_upper": swing_low + zone,
+                "swing_id": f"{swing.timeframe}:long:{swing_low:.5f}",
+                "max_attempts_per_swing": self.config.max_attempts_per_swing,
+                "max_cumulative_loss_r_per_swing": self.config.max_cumulative_loss_r_per_swing,
+                "require_reset_after_loss": self.config.require_reset_after_loss,
             },
         )
 
@@ -1079,6 +1197,9 @@ class SwingPointPolicy:
         if rr < self.config.min_rr:
             self.logger.info("摆点空头：R:R=%.2f < min=%.2f，跳过", rr, self.config.min_rr)
             return None
+        if self.config.max_rr > 0 and rr > self.config.max_rr:
+            tp = entry - risk * self.config.max_rr
+            rr = self.config.max_rr
         return CandidateSignal(
             ts=ctx.ts,
             symbol=ctx.symbol,
@@ -1100,5 +1221,10 @@ class SwingPointPolicy:
                 "swing_high": swing_high,
                 "swing_low": tp,
                 "zone_lower": swing_high - zone,
+                "zone_upper": swing_high,
+                "swing_id": f"{swing.timeframe}:short:{swing_high:.5f}",
+                "max_attempts_per_swing": self.config.max_attempts_per_swing,
+                "max_cumulative_loss_r_per_swing": self.config.max_cumulative_loss_r_per_swing,
+                "require_reset_after_loss": self.config.require_reset_after_loss,
             },
         )

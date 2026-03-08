@@ -264,10 +264,16 @@ def build_backtest_steps_from_csv(
             entry_zone_atr_ratio=0.45,
             stop_buffer_atr_ratio=0.15,
             min_rr=1.80,
+            max_rr=4.00,
             min_confirm_bar_body_atr_ratio=0.15,
+            recent_touch_bars=3,
             use_higher_tf_veto=True,
             veto_timeframe="high",
             veto_min_trend_score=0.45,
+            veto_phases=("impulse",),
+            max_attempts_per_swing=2,
+            max_cumulative_loss_r_per_swing=1.50,
+            require_reset_after_loss=True,
         )
     )
 
@@ -386,6 +392,7 @@ def build_backtest_steps_from_csv(
                 "future_high": future_high,
                 "future_low": future_low,
                 "future_close": future_close,
+                "current_price": current_m15.close,
             },
         )
 

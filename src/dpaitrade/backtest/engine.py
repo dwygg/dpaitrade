@@ -261,6 +261,8 @@ class BacktestEngine:
                 market_state.d1_bias,
             )
 
+            self._update_swing_trackers(portfolio_state=portfolio_state, market_state=market_state)
+
             if busy_until is not None and market_state.ts < busy_until:
                 self.logger.info(
                     "当前已有持仓覆盖此时刻，持仓结束时间=%s，跳过本步",
@@ -288,6 +290,15 @@ class BacktestEngine:
                 signal.rr_estimate,
                 signal.reason,
             )
+
+            swing_reject_reason = self._swing_reuse_reject_reason(
+                portfolio_state=portfolio_state,
+                signal=signal,
+            )
+            if swing_reject_reason:
+                result.total_risk_rejected += 1
+                self.logger.info(swing_reject_reason)
+                continue
 
             # --------------------------
             # 第一步：Agent 过滤与评分
@@ -358,6 +369,10 @@ class BacktestEngine:
                 trade_record=trade_record,
                 risk_pct=risk_decision.risk_pct,
             )
+            self._update_swing_tracker_after_trade(
+                portfolio_state=portfolio_state,
+                trade_record=trade_record,
+            )
             if self.cooldown_steps > 0:
                 cooldown_remaining = self.cooldown_steps
                 self.logger.info("成交后进入冷却期，冷却步数=%s", self.cooldown_steps)
@@ -389,6 +404,85 @@ class BacktestEngine:
         )
 
         return result
+
+
+    def _update_swing_trackers(
+        self,
+        portfolio_state: PortfolioState,
+        market_state,
+    ) -> None:
+        trackers = portfolio_state.meta.setdefault("swing_trackers", {})
+        current_price = float(market_state.meta.get("current_price", 0.0) or 0.0)
+        if current_price <= 0:
+            return
+        for tracker in trackers.values():
+            if not tracker.get("needs_reset"):
+                continue
+            zone_lower = tracker.get("zone_lower")
+            zone_upper = tracker.get("zone_upper")
+            if zone_lower is None or zone_upper is None:
+                continue
+            if current_price < float(zone_lower) or current_price > float(zone_upper):
+                tracker["zone_released"] = True
+
+    def _swing_reuse_reject_reason(
+        self,
+        portfolio_state: PortfolioState,
+        signal,
+    ) -> Optional[str]:
+        if str(signal.meta.get("policy", "")).startswith("swing_point") is False:
+            return None
+        swing_id = signal.meta.get("swing_id")
+        if not swing_id:
+            return None
+        trackers = portfolio_state.meta.setdefault("swing_trackers", {})
+        tracker = trackers.get(swing_id)
+        if not tracker:
+            return None
+        if tracker.get("invalidated"):
+            return f"摆点复用规则拒绝：{swing_id} 已失效"
+        max_attempts = int(signal.meta.get("max_attempts_per_swing") or 0)
+        if max_attempts > 0 and int(tracker.get("attempts", 0)) >= max_attempts:
+            return f"摆点复用规则拒绝：{swing_id} 尝试次数已达上限 {max_attempts}"
+        max_cum_loss = float(signal.meta.get("max_cumulative_loss_r_per_swing") or 0.0)
+        cum_loss_r = float(tracker.get("cumulative_loss_r", 0.0) or 0.0)
+        if max_cum_loss > 0 and cum_loss_r >= max_cum_loss:
+            return f"摆点复用规则拒绝：{swing_id} 累计亏损已达 {cum_loss_r:.2f}R"
+        require_reset = bool(signal.meta.get("require_reset_after_loss", False))
+        if require_reset and tracker.get("needs_reset") and not tracker.get("zone_released"):
+            return f"摆点复用规则拒绝：{swing_id} 上次亏损后尚未完成 zone reset"
+        return None
+
+    def _update_swing_tracker_after_trade(
+        self,
+        portfolio_state: PortfolioState,
+        trade_record: TradeRecord,
+    ) -> None:
+        swing_id = trade_record.meta.get("swing_id")
+        if not swing_id:
+            return
+        trackers = portfolio_state.meta.setdefault("swing_trackers", {})
+        tracker = trackers.setdefault(swing_id, {
+            "attempts": 0,
+            "cumulative_loss_r": 0.0,
+            "needs_reset": False,
+            "zone_released": False,
+            "invalidated": False,
+        })
+        tracker["attempts"] = int(tracker.get("attempts", 0)) + 1
+        tracker["zone_lower"] = trade_record.meta.get("zone_lower")
+        tracker["zone_upper"] = trade_record.meta.get("zone_upper")
+        tracker["last_close_reason"] = trade_record.close_reason
+        tracker["last_close_time"] = trade_record.close_time
+        if trade_record.close_reason == "摆点失效离场":
+            tracker["invalidated"] = True
+        if trade_record.pnl < 0:
+            tracker["cumulative_loss_r"] = float(tracker.get("cumulative_loss_r", 0.0)) + abs(float(trade_record.pnl_r))
+            tracker["needs_reset"] = True
+            tracker["zone_released"] = False
+        else:
+            tracker["needs_reset"] = False
+            tracker["zone_released"] = False
 
     def _apply_trade_record(
         self,

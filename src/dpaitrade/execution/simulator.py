@@ -768,6 +768,14 @@ class SimpleExecutionSimulator:
                 "risk_pct": risk_decision.risk_pct,
                 "initial_stop": initial_stop,
                 "policy": signal.meta.get("policy"),
+                "swing_id": signal.meta.get("swing_id"),
+                "swing_low": signal.meta.get("swing_low"),
+                "swing_high": signal.meta.get("swing_high"),
+                "zone_lower": signal.meta.get("zone_lower"),
+                "zone_upper": signal.meta.get("zone_upper"),
+                "max_attempts_per_swing": signal.meta.get("max_attempts_per_swing"),
+                "max_cumulative_loss_r_per_swing": signal.meta.get("max_cumulative_loss_r_per_swing"),
+                "require_reset_after_loss": signal.meta.get("require_reset_after_loss"),
             },
         )
 
